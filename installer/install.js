@@ -28,6 +28,7 @@ const OWNED = require('./lib/owned-install');
 const PROVIDER_SKILLS = require('./lib/provider-skills');
 const { transformOpencodeAgentFrontmatter } = require('./lib/opencode-agent');
 const CURSOR_NATIVE = require('./lib/cursor-native');
+const ANTIGRAVITY_NATIVE = require('./lib/antigravity-native');
 const HOST_HOOKS = require('./lib/host-hooks');
 const PORTABLE = require('./lib/portable-process');
 const PLATFORM_PATHS = require('./lib/platform-paths');
@@ -286,7 +287,7 @@ const PROVIDERS = [
   // migrator, Foundry, a neovim manager), so those need the agent's dir too.
   { id: 'hermes',     label: 'Hermes Agent',        mech: 'native hermes skills copy',     detect: 'command:hermes' },
   { id: 'aider-desk', label: 'Aider Desk',          mech: 'native skills copy',   detect: 'command:aider-desk||macapp:aider-desk', profile: 'aider-desk' },
-  { id: 'antigravity-cli', label: 'Antigravity CLI', mech: 'agy plugin install',           detect: 'command:agy' },
+  { id: 'antigravity-cli', label: 'Antigravity CLI', mech: 'agy plugin install',           detect: 'command:agy||file:$HOME/.gemini/bin/agy.exe||file:$HOME/.gemini/bin/agy' },
   { id: 'amp',        label: 'Sourcegraph Amp',     mech: 'npx skills add (amp)',          detect: 'command:amp',             profile: 'amp' },
   { id: 'bob',        label: 'IBM Bob',             mech: 'npx skills add (bob)',          detect: 'command:bob&&dir:$HOME/.bob', profile: 'bob' },
   { id: 'codebuddy',  label: 'CodeBuddy Code',      mech: 'npx skills add (codebuddy)',    detect: 'command:codebuddy', profile: 'codebuddy' },
@@ -885,6 +886,13 @@ function installViaSkills(ctx, prov) {
   results.detected++;
   say(`→ ${prov.label} ${prov.soft ? 'selected' : 'detected'}`);
   if (PROVIDER_SKILLS.usesNativeSkills(prov.id)) {
+    if ((prov.id === 'antigravity' || prov.id === 'antigravity-2')
+        && ANTIGRAVITY_NATIVE.shouldSkipRedundantSkillCopy(prov.id, { home: os.homedir(), installedProviders: results.installed })) {
+      note('  skipped redundant skills copy: unified caveman plugin is already installed in ~/.gemini/config/plugins/caveman');
+      results.skipped.push([prov.id, 'covered by Antigravity plugin']);
+      process.stdout.write('\n');
+      return;
+    }
     try {
       const installed = PROVIDER_SKILLS.install({
         provider: prov.id,
@@ -1242,8 +1250,8 @@ function installHermes(ctx) {
 // the plugin is enabled; agy has no session-start hook (PreInvocation runs
 // before every model call). Checked live with agy 1.2.17: caveman voice with
 // the rule, normal prose without it or with the plugin disabled.
-const AGY_PLUGIN_NAME = 'caveman';
-const AGY_SKILL_DIRS = HERMES_SKILL_DIRS;
+const AGY_PLUGIN_NAME = ANTIGRAVITY_NATIVE.AGY_PLUGIN_NAME;
+const AGY_SKILL_DIRS = ANTIGRAVITY_NATIVE.AGY_SKILL_DIRS;
 
 function installAntigravityCli(ctx) {
   const { say, note, warn, opts, repoRoot, results } = ctx;
@@ -1255,9 +1263,21 @@ function installAntigravityCli(ctx) {
     process.stdout.write('\n');
     return;
   }
+  const agyCmd = ANTIGRAVITY_NATIVE.resolveAgyCommand({ home: os.homedir(), hasCmd }) || 'agy';
+  const hookNodeBin = ANTIGRAVITY_NATIVE.resolveAntigravityHookNode({
+    opts,
+    isBun: IS_BUN,
+    absoluteNodePath,
+    nodeMeetsFloor,
+    env: process.env,
+  });
+  const withHooks = Boolean(hookNodeBin);
+  if (opts.withHooks !== false && !withHooks) {
+    note('  no Node >=18 found for hooks; falling back to static rules/AGENTS.md');
+  }
   if (opts.dryRun) {
-    note(`  would stage a ${AGY_PLUGIN_NAME} plugin (${AGY_SKILL_DIRS.length} skills + rules/AGENTS.md)`);
-    runSpawn('agy', ['plugin', 'install', `<staging>/${AGY_PLUGIN_NAME}`], null, true);
+    note(`  would stage a ${AGY_PLUGIN_NAME} plugin (${AGY_SKILL_DIRS.length} skills, 3 agents, ${withHooks ? 'SessionStart + PreInvocation hooks' : 'rules/AGENTS.md'})`);
+    runSpawn(agyCmd, ['plugin', 'install', `<staging>/${AGY_PLUGIN_NAME}`], null, true);
     results.installed.push('antigravity-cli');
     process.stdout.write('\n');
     return;
@@ -1265,18 +1285,24 @@ function installAntigravityCli(ctx) {
   const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-agy-'));
   try {
     const pluginDir = path.join(staging, AGY_PLUGIN_NAME);
-    fs.mkdirSync(path.join(pluginDir, 'rules'), { recursive: true });
-    fs.writeFileSync(path.join(pluginDir, 'plugin.json'), JSON.stringify({
-      name: AGY_PLUGIN_NAME,
-      description: 'Caveman: terse replies, every technical fact kept',
-    }, null, 2) + '\n');
-    fs.copyFileSync(path.join(repoRoot, 'src', 'rules', 'caveman-activate.md'), path.join(pluginDir, 'rules', 'AGENTS.md'));
-    for (const name of AGY_SKILL_DIRS) {
-      fs.cpSync(path.join(repoRoot, 'skills', name), path.join(pluginDir, 'skills', name), { recursive: true });
-    }
-    if (spawnOk(runSpawn('agy', ['plugin', 'install', pluginDir], null, false))) {
+    ANTIGRAVITY_NATIVE.stageAntigravityPlugin({
+      repoRoot,
+      pluginDir,
+      node: hookNodeBin || 'node',
+      withHooks,
+    });
+    const shownDir = /[^\w@%+=:,./-]/.test(pluginDir) ? shellEscape(pluginDir) : pluginDir;
+    process.stdout.write(`  $ ${agyCmd} plugin install ${shownDir}\n`);
+    const r = captureSpawn(agyCmd, ['plugin', 'install', pluginDir]);
+    if (r && r.stdout) process.stdout.write(r.stdout);
+    if (r && r.stderr) process.stderr.write(r.stderr);
+    if (r && r.error) process.stderr.write(`  ${r.error.message}\n`);
+    if (spawnOk(r)) {
       results.installed.push('antigravity-cli');
       note('  new agy sessions start in caveman mode; `agy plugin disable caveman` turns it off');
+    } else if (ANTIGRAVITY_NATIVE.isOrgDisabledError(r && r.stdout, r && r.stderr)) {
+      warn('  Antigravity plugins are disabled by your organization; skipping plugin install.');
+      results.skipped.push(['antigravity-cli', 'plugins disabled by organization']);
     } else {
       results.failed.push(['antigravity-cli', 'agy plugin install failed']);
     }
@@ -2403,13 +2429,11 @@ function uninstall(ctx) {
   }
 
   // Antigravity CLI plugin. agy owns its copy; same idempotency probe as gemini.
-  if (hasCmd('agy')) {
-    const probe = captureSpawn('agy', ['plugin', 'list']);
-    if (spawnOk(probe) && /"name":\s*"caveman"/.test(probe.stdout || '')) {
-      const r = runSpawn('agy', ['plugin', 'uninstall', AGY_PLUGIN_NAME], null, opts.dryRun);
-      if (spawnOk(r)) ok('  removed the Antigravity CLI plugin');
-      else cleanupFailed = true;
-    }
+  const agyCmd = ANTIGRAVITY_NATIVE.resolveAgyCommand({ home: os.homedir(), hasCmd });
+  if (agyCmd && ANTIGRAVITY_NATIVE.agyHasCaveman(agyCmd, captureSpawn, spawnOk)) {
+    const r = runSpawn(agyCmd, ['plugin', 'uninstall', AGY_PLUGIN_NAME], null, opts.dryRun);
+    if (spawnOk(r)) ok('  removed the Antigravity CLI plugin');
+    else cleanupFailed = true;
   }
 
   // Copilot CLI sessionStart hook — same journal/digest contract.

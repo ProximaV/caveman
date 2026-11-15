@@ -7,10 +7,20 @@ on:
       - skills/caveman/SKILL.md
       - skills/ultracave/SKILL.md
       - skills/megacave/SKILL.md
+      - skills/caveman-commit/SKILL.md
+      - skills/caveman-review/SKILL.md
+      - skills/caveman-help/SKILL.md
+      - skills/caveman-stats/SKILL.md
       - skills/cavecrew/SKILL.md
       - agents/cavecrew-*.md
       - skills/caveman-compress/SKILL.md
       - skills/caveman-compress/scripts/**
+      - plugins/caveman/assets/caveman.svg
+      - src/hooks/package.json
+      - src/hooks/caveman-antigravity.js
+      - src/hooks/caveman-config.js
+      - src/hooks/caveman-parse.js
+      - src/hooks/caveman-stats.js
 
 concurrency:
   group: sync-skill
@@ -57,6 +67,25 @@ jobs:
           cp agents/cavecrew-builder.md plugins/caveman/agents/cavecrew-builder.md
           cp agents/cavecrew-reviewer.md plugins/caveman/agents/cavecrew-reviewer.md
 
+      - name: Sync Antigravity plugin mirrors
+        run: |
+          mkdir -p plugins/antigravity/hooks plugins/antigravity/assets
+          cp \
+            src/hooks/package.json \
+            src/hooks/caveman-antigravity.js \
+            src/hooks/caveman-config.js \
+            src/hooks/caveman-parse.js \
+            src/hooks/caveman-stats.js \
+            plugins/antigravity/hooks/
+          cp plugins/caveman/assets/caveman.svg plugins/antigravity/assets/caveman.svg
+          for s in caveman ultracave megacave caveman-commit caveman-review caveman-help caveman-stats cavecrew caveman-compress; do
+            mkdir -p "plugins/antigravity/skills/$s"
+            cp "skills/$s/SKILL.md" "plugins/antigravity/skills/$s/SKILL.md"
+          done
+          rm -rf plugins/antigravity/skills/caveman-compress/scripts
+          cp -r skills/caveman-compress/scripts plugins/antigravity/skills/caveman-compress/scripts
+          rm -rf plugins/antigravity/skills/caveman-compress/scripts/__pycache__
+
       - name: Rebuild caveman.skill ZIP
         # `zip -r` ADDS to an existing archive, and dist/caveman.skill is tracked
         # (.gitignore keeps it with `!dist/caveman.skill`), so a file deleted from
@@ -78,6 +107,9 @@ jobs:
             plugins/caveman/agents/cavecrew-investigator.md \
             plugins/caveman/agents/cavecrew-builder.md \
             plugins/caveman/agents/cavecrew-reviewer.md \
+            plugins/antigravity/skills/ \
+            plugins/antigravity/hooks/ \
+            plugins/antigravity/assets/caveman.svg \
             dist/caveman.skill
           git diff --staged --quiet && exit 0
           git commit -m "chore: sync SKILL.md copies [skip ci]"

@@ -1,8 +1,10 @@
 package nativehook
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +41,44 @@ func TestConfiguredModeReadsTheNewConfigHomeFirst(t *testing.T) {
 	write(legacy, `{"think":{"mode":"compress"}}`)
 	if got := configuredMode(home); got != "record" {
 		t.Fatalf("record in the new config: got %q, want record", got)
+	}
+}
+
+func TestAntigravityNormalizationAndPreToolRequest(t *testing.T) {
+	if !validAgent("antigravity") {
+		t.Fatal("expected antigravity to be a valid agent")
+	}
+	if got := normalizeEvent("antigravity", "PreInvocation"); got != "UserPromptSubmit" {
+		t.Fatalf("normalizeEvent PreInvocation = %q, want UserPromptSubmit", got)
+	}
+	if !toolNeedsRepositoryState("run_command", map[string]any{"CommandLine": "go test ./..."}) {
+		t.Fatal("expected CommandLine go test to require repository state")
+	}
+
+	home := t.TempDir()
+	workspace := t.TempDir()
+	sample := filepath.Join(workspace, "sample.txt")
+	if err := os.WriteFile(sample, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	event := hostEvent{
+		"hookEventName":  "PreToolUse",
+		"conversationId": "conv-123",
+		"workspacePaths": []any{workspace},
+		"toolCall": map[string]any{
+			"id":   "tc-1",
+			"name": "read_file",
+			"args": map[string]any{"Path": "sample.txt"},
+		},
+	}
+	req := preToolRequest(context.Background(), home, "antigravity", "PreToolUse", "conv-123", event)
+	if req.Session.ID != "antigravity:conv-123" {
+		t.Fatalf("Session.ID = %q, want antigravity:conv-123", req.Session.ID)
+	}
+	if req.Tool == nil || req.Tool.Name != "read_file" {
+		t.Fatalf("Tool = %+v, want read_file", req.Tool)
+	}
+	if !strings.HasPrefix(req.Tool.InputState, "sha256:") {
+		t.Fatalf("Tool.InputState = %q, want sha256 prefix", req.Tool.InputState)
 	}
 }

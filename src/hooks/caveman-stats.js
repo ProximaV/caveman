@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// caveman-stats — read the active Claude Code session log, print real token
+// caveman-stats — read the active Claude Code or Antigravity session log, print real token
 // usage and mode attribution. A transcript alone cannot establish savings.
 //
 // Run directly:    node src/hooks/caveman-stats.js  (installed: next to the
 //                  other hooks, wherever the installer or plugin put them)
 // Inside Claude:   /caveman-stats triggers this via the UserPromptSubmit hook.
+// Inside Antigravity: /caveman-stats triggers this via PreInvocation (`--host antigravity`).
 // Hook integration passes --session-file <transcript_path> so we always read
 // the active session, not whichever JSONL was modified most recently.
 // SessionEnd:      `--record` reads the hook payload on stdin and appends one
@@ -134,6 +135,71 @@ function findRecentSession(claudeDir) {
   return best ? best.file : null;
 }
 
+function isAntigravityHost(host) {
+  const h = typeof host === 'string' ? host.trim().toLowerCase() : '';
+  return h === 'antigravity' || h === 'antigravity-cli' || h === 'agy';
+}
+
+function resolveAntigravityStateDir() {
+  if (typeof process.env.PLUGIN_DATA === 'string' && process.env.PLUGIN_DATA.trim()) {
+    return path.resolve(process.env.PLUGIN_DATA.trim());
+  }
+  const cwdAgents = path.join(process.cwd(), '.agents');
+  try {
+    if (fs.statSync(cwdAgents).isDirectory()) {
+      return path.join(cwdAgents, '.caveman-state');
+    }
+  } catch {}
+  const home = os.homedir();
+  for (const sub of ['antigravity', 'antigravity-cli']) {
+    const candidate = path.join(home, '.gemini', sub, 'plugin_data', 'caveman');
+    try {
+      if (fs.statSync(candidate).isDirectory()) return candidate;
+    } catch {}
+  }
+  return path.join(home, '.gemini', 'config', '.caveman-state');
+}
+
+function findRecentAntigravitySession() {
+  const roots = [];
+  if (typeof process.env.AGY_DATA_DIR === 'string' && process.env.AGY_DATA_DIR.trim()) {
+    roots.push(path.join(path.resolve(process.env.AGY_DATA_DIR.trim()), 'brain'));
+  } else {
+    const home = os.homedir();
+    roots.push(
+      path.join(home, '.gemini', 'antigravity', 'brain'),
+      path.join(home, '.gemini', 'antigravity-cli', 'brain'),
+    );
+  }
+  let best = null;
+  for (const brainDir of roots) {
+    let convs;
+    try { convs = fs.readdirSync(brainDir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const conv of convs) {
+      if (!conv.isDirectory()) continue;
+      const logsDir = path.join(brainDir, conv.name, '.system_generated', 'logs');
+      for (const fileName of ['transcript.jsonl', 'transcript_full.jsonl']) {
+        const candidate = path.join(logsDir, fileName);
+        let st;
+        try { st = fs.statSync(candidate); } catch { continue; }
+        if (st.isFile() && (!best || st.mtimeMs > best.mtime)) {
+          best = { file: candidate, mtime: st.mtimeMs };
+        }
+        break;
+      }
+    }
+  }
+  return best ? best.file : null;
+}
+
+function extractSessionIdFromPath(sessionFile) {
+  const match = /[\\/]brain[\\/]([^\\/]+)[\\/]\.system_generated[\\/]logs[\\/]transcript(?:_full)?\.jsonl$/i
+    .exec(String(sessionFile || ''));
+  if (match && match[1]) return match[1];
+  return path.basename(sessionFile, '.jsonl');
+}
+
 const isTokenCount = (value) => Number.isSafeInteger(value) && value >= 0;
 
 // A total contains only reported, valid counts. Availability travels with it
@@ -175,7 +241,36 @@ function parseSession(filePath) {
     if (!line.trim()) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
-    if (!entry || entry.type !== 'assistant' || !entry.message || typeof entry.message !== 'object') continue;
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.type === 'PLANNER_RESPONSE' && (!entry.source || entry.source === 'MODEL')) {
+      const outRaw = entry.output_tokens;
+      const cacheRaw = entry.cache_read_tokens !== undefined
+        ? entry.cache_read_tokens
+        : entry.cache_read_input_tokens;
+      const hasUsage = isTokenCount(outRaw) || isTokenCount(cacheRaw) || isTokenCount(entry.input_tokens);
+      if (!hasUsage) continue;
+      const stepKey = (entry.step_index !== undefined && entry.step_index !== null)
+        ? `agy-step:${entry.step_index}`
+        : null;
+      let response = stepKey ? seenResponses.get(stepKey) : null;
+      if (!response) {
+        const tsRaw = entry.created_at || entry.timestamp;
+        const ts = tsRaw ? Date.parse(tsRaw) : NaN;
+        response = { ts: Number.isFinite(ts) ? ts : null, outputTokens: null, cacheReadTokens: null };
+        messages.push(response);
+        if (stepKey) seenResponses.set(stepKey, response);
+      }
+      if (response.outputTokens === null && isTokenCount(outRaw)) {
+        response.outputTokens = outRaw;
+      }
+      if (response.cacheReadTokens === null && isTokenCount(cacheRaw)) {
+        response.cacheReadTokens = cacheRaw;
+      }
+      const m = entry.model || entry.model_name || entry.modelName;
+      if (!model && typeof m === 'string' && m) model = m;
+      continue;
+    }
+    if (entry.type !== 'assistant' || !entry.message || typeof entry.message !== 'object') continue;
     if (!model && entry.message.model) model = entry.message.model;
     const key = entry.message.id ? (entry.requestId || '') + ':' + entry.message.id : null;
     let response = key ? seenResponses.get(key) : null;
@@ -469,12 +564,12 @@ function formatStats({ outputTokens, outputAvailability, cacheReadTokens, cacheR
 // Resolve this session's mode and per-mode attribution, then append a snapshot
 // to the lifetime history. Shared by /caveman-stats and SessionEnd --record.
 function recordSnapshot({ claudeDir, historyPath, sessionFile, parsed, sessionIdArg }) {
-  // Session id: from the UserPromptSubmit (--session-id) or SessionEnd hook
-  // payload. Falling back to the transcript filename is not a guess — Claude
-  // Code names transcripts by session id, which is why the lifetime history has
-  // always keyed on it.
+  // Session id: from the UserPromptSubmit/PreInvocation (--session-id) or
+  // SessionEnd hook payload. Fall back to Antigravity's brain/<conversationId>
+  // parent folder when present, or Claude Code's UUID transcript basename.
+  const rawFallbackId = extractSessionIdFromPath(sessionFile);
   const sessionId = validateSessionId(sessionIdArg)
-    || validateSessionId(path.basename(sessionFile, '.jsonl'));
+    || validateSessionId(rawFallbackId);
 
   // Read whichever layer holds this session's state, and take the mtime from
   // that same file so the 'flag-mtime' attribution fallback measures the right
@@ -506,7 +601,7 @@ function recordSnapshot({ claudeDir, historyPath, sessionFile, parsed, sessionId
   if (parsed.turns > 0) {
     appendFlag(historyPath, JSON.stringify({
       ts: Date.now(),
-      session_id: sessionId || path.basename(sessionFile, '.jsonl'),
+      session_id: sessionId || rawFallbackId,
       mode: mode || null,
       model: parsed.model || null,
       output_tokens: parsed.outputTokens,
@@ -526,17 +621,21 @@ function recordSnapshot({ claudeDir, historyPath, sessionFile, parsed, sessionId
 function main() {
   const args = process.argv.slice(2);
   const hostIdx = args.indexOf('--host');
-  const host = hostIdx !== -1 ? args[hostIdx + 1]
-    : process.env.GEMINI_CLI === '1' ? 'gemini' : 'claude';
-  if (host === 'gemini') {
+  const rawHost = hostIdx !== -1 ? args[hostIdx + 1]
+    : process.env.GEMINI_CLI === '1' ? 'gemini'
+    : (!process.env.CLAUDE_CONFIG_DIR && (process.env.ANTIGRAVITY_CLI_ALIAS || process.env.AGY_DATA_DIR)) ? 'antigravity'
+    : 'claude';
+  if (rawHost === 'gemini') {
     // Gemini CLI's ShellExecutionService identifies child commands with
     // GEMINI_CLI=1. Its statistics live in the host session, not Claude JSONL.
     // Stop before reading or updating another host's history/flags (#403).
     process.stdout.write('Gemini CLI: use /stats model for current session token usage, or /stats session for session statistics.\nCaveman savings: unknown. Claude Code transcripts are not Gemini usage.\n');
     return;
   }
-  if (host !== 'claude') {
-    process.stderr.write('caveman-stats: --host must be claude or gemini.\n');
+  const isAgy = isAntigravityHost(rawHost);
+  const host = isAgy ? 'antigravity' : rawHost;
+  if (host !== 'claude' && host !== 'antigravity') {
+    process.stderr.write('caveman-stats: --host must be claude, antigravity, or gemini.\n');
     process.exitCode = 2;
     return;
   }
@@ -549,12 +648,17 @@ function main() {
   const sinceIdx = args.indexOf('--since');
   const sinceArg = sinceIdx !== -1 ? args[sinceIdx + 1] : null;
 
-  const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-  const historyPath = path.join(claudeDir, '.caveman-history.jsonl');
+  const stateDir = isAgy
+    ? resolveAntigravityStateDir()
+    : (process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
+  const historyPath = path.join(stateDir, '.caveman-history.jsonl');
 
   // Retire the old numeric badge even for lifetime, empty, or failed reads.
   // safeWriteFlag refuses symlinks; original history rows remain untouched.
-  safeWriteFlag(path.join(claudeDir, '.caveman-statusline-suffix'), '');
+  // Antigravity stats runs must not touch Claude's config dir.
+  if (!isAgy) {
+    safeWriteFlag(path.join(stateDir, '.caveman-statusline-suffix'), '');
+  }
 
   // Lifetime aggregation paths short-circuit before we need a live session.
   if (all || sinceArg) {
@@ -568,47 +672,58 @@ function main() {
     return;
   }
 
-  const sessionFile = sessionFileArg || findRecentSession(claudeDir);
+  const sessionFile = sessionFileArg
+    || (isAgy ? findRecentAntigravitySession() : findRecentSession(stateDir));
 
   if (!sessionFile) {
-    process.stderr.write('caveman-stats: no Claude Code session found.\n');
+    process.stderr.write(
+      isAgy ? 'caveman-stats: no Antigravity session found.\n' : 'caveman-stats: no Claude Code session found.\n',
+    );
     process.exit(1);
   }
 
   let parsed;
   try { parsed = parseSession(sessionFile); }
   catch (error) {
-    process.stderr.write(`caveman-stats: could not read Claude Code session ${sessionFile} (${error.code || 'read failed'}). Usage unavailable.\n`);
+    const label = isAgy ? 'Antigravity' : 'Claude Code';
+    process.stderr.write(`caveman-stats: could not read ${label} session ${sessionFile} (${error.code || 'read failed'}). Usage unavailable.\n`);
     process.exitCode = 1;
     return;
   }
 
-  const { mode, attribution } = recordSnapshot({ claudeDir, historyPath, sessionFile, parsed, sessionIdArg });
+  const { mode, attribution } = recordSnapshot({ claudeDir: stateDir, historyPath, sessionFile, parsed, sessionIdArg });
 
   if (share) {
     process.stdout.write(formatShare({ ...parsed, mode, attribution }) + '\n');
   } else {
-    const scanDirs = [claudeDir, process.cwd()].filter((d, i, a) => a.indexOf(d) === i);
+    const scanDirs = [stateDir, process.cwd()].filter((d, idx, a) => a.indexOf(d) === idx);
     const compressed = summarizeCompressed(findCompressedPairs(scanDirs));
     process.stdout.write(formatStats({ ...parsed, mode, sessionPath: sessionFile, compressed, attribution }));
   }
 }
 
-// SessionEnd payload: { session_id, transcript_path, reason, ... }. Only the
-// transcript the host names is read; never guess the newest one on disk.
+// SessionEnd payload: { session_id, transcript_path, ... } or Antigravity
+// { conversationId, transcriptPath, ... }. Only the transcript named is read.
 function recordFromHook(payload) {
   let data;
   try { data = JSON.parse(payload); } catch (e) { return; }
-  if (!data || typeof data.transcript_path !== 'string' || !data.transcript_path) return;
-  const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-  const sessionFile = data.transcript_path;
+  const sessionFile = data && (
+    (typeof data.transcript_path === 'string' && data.transcript_path)
+    || (typeof data.transcriptPath === 'string' && data.transcriptPath)
+    || ''
+  );
+  if (!sessionFile) return;
+  const isAgyPayload = typeof data.transcriptPath === 'string' || typeof data.conversationId === 'string';
+  const stateDir = (isAgyPayload && !process.env.CLAUDE_CONFIG_DIR)
+    ? resolveAntigravityStateDir()
+    : (process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
   const parsed = parseSession(sessionFile);
   recordSnapshot({
-    claudeDir,
-    historyPath: path.join(claudeDir, '.caveman-history.jsonl'),
+    claudeDir: stateDir,
+    historyPath: path.join(stateDir, '.caveman-history.jsonl'),
     sessionFile,
     parsed,
-    sessionIdArg: data.session_id,
+    sessionIdArg: data.session_id || data.sessionId || data.conversationId,
   });
 }
 

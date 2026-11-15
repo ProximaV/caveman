@@ -45,6 +45,11 @@ export async function modulesDoctor(): Promise<void> {
     const ask = h.agentAsk(agent.id);
     if (ask) notes.push(`· ${agent.id}: ${ask}`);
   }
+  const agy = h.antigravityDoctor?.();
+  if (agy?.configured) {
+    failures.push(...agy.failures);
+    notes.push(...agy.notes);
+  }
   const traffic = h.agentTraffic();
   if (traffic.fix) notes.push(`· ${traffic.line} · ${traffic.fix}`);
   for (const failure of failures) console.log(`✗ ${failure}`);

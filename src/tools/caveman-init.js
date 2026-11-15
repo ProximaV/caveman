@@ -114,6 +114,9 @@ const AGENTS = [
   { id: 'opencode', file: '.opencode/AGENTS.md',
     frontmatter: '',
     mode: 'append' },
+  { id: 'antigravity', file: '.agents/rules/caveman.md',
+    frontmatter: '---\ntrigger: always_on\n---\n\n',
+    mode: 'replace' },
   { id: 'agents',   file: 'AGENTS.md',
     frontmatter: '',
     mode: 'append' },
@@ -124,6 +127,16 @@ const AGENTS = [
     installer: 'openclaw' },
 ];
 
+const AGY_HOOK_FILES = ['package.json', 'caveman-antigravity.js', 'caveman-config.js', 'caveman-parse.js', 'caveman-stats.js'];
+const AGY_HOOK_SPEC = {
+  SessionStart: [{ type: 'command', command: 'node ./hooks/caveman-antigravity.js session-start', timeout: 10 }],
+  PreInvocation: [{ type: 'command', command: 'node ./hooks/caveman-antigravity.js pre-invocation', timeout: 10 }],
+};
+
+function isSymlinkPath(p) {
+  try { return fs.lstatSync(p).isSymbolicLink(); } catch (_) { return false; }
+}
+
 function loadRuleBody() {
   // Prefer the in-repo source-of-truth when available.
   try {
@@ -133,9 +146,87 @@ function loadRuleBody() {
   return RULE_BODY;
 }
 
+function processAntigravityWithHooks(targetDir, opts) {
+  const hookSrcDir = path.resolve(__dirname, '..', 'hooks');
+  if (!AGY_HOOK_FILES.every((f) => fs.existsSync(path.join(hookSrcDir, f)))) {
+    return null;
+  }
+  const agentsDir = path.join(targetDir, '.agents');
+  const hooksDir = path.join(agentsDir, 'hooks');
+  const hooksJsonPath = path.join(agentsDir, 'hooks.json');
+  const rulePath = path.join(agentsDir, 'rules', 'caveman.md');
+  const syms = [agentsDir, hooksDir, hooksJsonPath, path.join(agentsDir, 'rules'), rulePath,
+    ...AGY_HOOK_FILES.map((f) => path.join(hooksDir, f))];
+  if (syms.some(isSymlinkPath)) {
+    return { status: 'skipped-symlink', label: '?', detail: '.agents/hooks.json' };
+  }
+
+  const existed = fs.existsSync(hooksJsonPath);
+  let doc = {};
+  if (existed) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(hooksJsonPath, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { status: 'skipped-exists', label: '?', detail: '.agents/hooks.json' };
+      }
+      doc = parsed;
+    } catch (_) {
+      return { status: 'skipped-exists', label: '?', detail: '.agents/hooks.json' };
+    }
+  }
+
+  const hooksMatch = JSON.stringify(doc.caveman) === JSON.stringify(AGY_HOOK_SPEC);
+  const filesMatch = AGY_HOOK_FILES.every((f) => {
+    const dst = path.join(hooksDir, f);
+    if (!fs.existsSync(dst)) return false;
+    return fs.readFileSync(dst, 'utf8') === fs.readFileSync(path.join(hookSrcDir, f), 'utf8');
+  });
+  const rulePresent = fs.existsSync(rulePath);
+
+  if (hooksMatch && filesMatch && !rulePresent && !opts.force) {
+    return { status: 'skipped-already-installed', label: '=', detail: '.agents/hooks.json' };
+  }
+  if (existed && doc.caveman !== undefined && !hooksMatch && !opts.force) {
+    return { status: 'skipped-exists', label: '?', detail: '.agents/hooks.json' };
+  }
+
+  if (!opts.dryRun) {
+    if (rulePresent) {
+      try { fs.unlinkSync(rulePath); } catch (_) {}
+      try {
+        const rulesDir = path.dirname(rulePath);
+        if (fs.readdirSync(rulesDir).length === 0) fs.rmdirSync(rulesDir);
+      } catch (_) {}
+    }
+    for (const f of AGY_HOOK_FILES) {
+      const dst = path.join(hooksDir, f);
+      if (f === 'package.json' && fs.existsSync(dst)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(dst, 'utf8'));
+          if (!(pkg && pkg.type === 'commonjs' && Object.keys(pkg).length === 1)) continue;
+        } catch (_) {
+          continue;
+        }
+      }
+      writeAtomic(dst, fs.readFileSync(path.join(hookSrcDir, f), 'utf8'));
+    }
+    const nextDoc = { ...doc, caveman: AGY_HOOK_SPEC };
+    writeAtomic(hooksJsonPath, JSON.stringify(nextDoc, null, 2) + '\n');
+  }
+
+  if (existed && (opts.force || doc.caveman !== undefined || rulePresent || !filesMatch)) {
+    return { status: 'overwritten', label: '!', detail: '.agents/hooks.json' };
+  }
+  return { status: 'added', label: '+', detail: '.agents/hooks.json' };
+}
+
 function processAgent(agent, targetDir, ruleBody, opts) {
   if (agent.installer === 'openclaw') {
     return processOpenclaw(opts);
+  }
+  if (agent.id === 'antigravity' && opts.withHooks) {
+    const hookResult = processAntigravityWithHooks(targetDir, opts);
+    if (hookResult) return hookResult;
   }
   const fullPath = path.join(targetDir, agent.file);
   // A symlinked rule file (AGENTS.md -> CLAUDE.md) is the user's single source.
@@ -242,11 +333,12 @@ function processOpenclaw(opts) {
 }
 
 function parseArgs(argv) {
-  const opts = { dryRun: false, force: false, only: null, target: process.cwd() };
+  const opts = { dryRun: false, force: false, withHooks: false, only: null, target: process.cwd() };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--force' || a === '-f') opts.force = true;
+    else if (a === '--with-hooks') opts.withHooks = true;
     else if (a === '--only') { opts.only = argv[++i]; }
     else if (a === '-h' || a === '--help') opts.help = true;
     else if (!a.startsWith('-')) opts.target = path.resolve(a);
@@ -267,17 +359,18 @@ function parseArgs(argv) {
 function help() {
   console.log(`caveman init — drop always-on caveman rule into a target repo
 
-Usage: caveman-init.js [target-dir] [--dry-run] [--force] [--only <agent>]
+Usage: caveman-init.js [target-dir] [--dry-run] [--force] [--with-hooks] [--only <agent>]
 
 Defaults to current working directory. Idempotent — safe to re-run.
 
 Targets installed:
-${AGENTS.map(a => `  ${a.id.padEnd(10)} ${a.file || a.description || ''}`).join('\n')}
+${AGENTS.map(a => `  ${a.id.padEnd(11)} ${a.file || a.description || ''}`).join('\n')}
 
 Flags:
-  --dry-run   show what would change, do not write
-  --force     overwrite existing rule files (default: skip)
-  --only <id> only install for one agent (id from list above)
+  --dry-run     show what would change, do not write
+  --force       overwrite existing rule files (default: skip)
+  --with-hooks  for antigravity, write .agents/hooks.json + .agents/hooks/ instead of .agents/rules/caveman.md
+  --only <id>   only install for one agent (id from list above)
 `);
 }
 
@@ -293,7 +386,7 @@ function main() {
   for (const agent of AGENTS) {
     if (opts.only && opts.only !== agent.id) continue;
     const result = processAgent(agent, opts.target, ruleBody, opts);
-    const target = agent.file || result.detail || agent.description || agent.id;
+    const target = result.detail || agent.file || agent.description || agent.id;
     console.log(`  ${result.label} ${target} (${result.status})`);
     if (result.status === 'added' || result.status === 'installed' || result.status === 'would-add') counts.added++;
     else if (result.status === 'appended') counts.appended++;

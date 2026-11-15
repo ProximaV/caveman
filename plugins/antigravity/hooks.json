@@ -1,0 +1,18 @@
+{
+  "caveman": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./hooks/caveman-antigravity.js session-start",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./hooks/caveman-antigravity.js pre-invocation",
+        "timeout": 10
+      }
+    ]
+  }
+}

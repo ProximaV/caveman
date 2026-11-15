@@ -36,12 +36,12 @@ func Run(ctx context.Context, home, agent, adapterPath, nodePath string, raw []b
 	if err := json.Unmarshal(raw, &event); err != nil || event == nil {
 		return nil
 	}
-	eventName := normalizeEvent(agent, firstString(event, "hook_event_name", "event_name", "event"))
+	eventName := normalizeEvent(agent, firstString(event, "hook_event_name", "hookEventName", "event_name", "event"))
 	if eventName != "PreToolUse" && eventName != "PermissionRequest" {
 		delegate(ctx, adapterPath, nodePath, agent, raw, stdout, stderr)
 		return nil
 	}
-	sessionID := bounded(firstString(event, "session_id", "sessionId"), 160)
+	sessionID := bounded(firstString(event, "session_id", "sessionId", "conversationId"), 160)
 	if sessionID == "" {
 		return nil
 	}
@@ -54,6 +54,10 @@ func Run(ctx context.Context, home, agent, adapterPath, nodePath string, raw []b
 	if request.PolicyMode == "record" || response.Context == "" {
 		return nil
 	}
+	if agent == "antigravity" {
+		// Antigravity PreToolUse only accepts decision/reason/overwrite, not hookSpecificOutput.additionalContext.
+		return nil
+	}
 	return json.NewEncoder(stdout).Encode(map[string]any{
 		"hookSpecificOutput": map[string]any{
 			"hookEventName":     eventName,
@@ -64,7 +68,7 @@ func Run(ctx context.Context, home, agent, adapterPath, nodePath string, raw []b
 
 func validAgent(agent string) bool {
 	switch agent {
-	case "claude", "codex", "hermes", "gemini", "opencode", "pi":
+	case "claude", "codex", "hermes", "gemini", "opencode", "pi", "antigravity":
 		return true
 	default:
 		return false
@@ -90,30 +94,65 @@ func normalizeEvent(agent, value string) string {
 			return "Stop"
 		}
 	}
+	if agent == "antigravity" && value == "PreInvocation" {
+		return "UserPromptSubmit"
+	}
 	return value
 }
 
 func preToolRequest(ctx context.Context, home, agent, eventName, sessionID string, event hostEvent) nativeruntime.Request {
 	cwd := bounded(firstString(event, "cwd", "working_directory", "workingDirectory"), 4096)
 	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-	toolName := bounded(firstString(event, "tool_name", "toolName"), 160)
-	tool := &nativeruntime.Tool{Name: toolName}
-	claimedRepositoryState := bounded(firstString(event, "repository_state", "repositoryState"), 512)
-	repositoryState := claimedRepositoryState
-	for _, key := range []string{"tool_input", "toolInput", "args"} {
-		if input, ok := event[key]; ok {
-			if encoded, err := json.Marshal(input); err == nil {
-				tool.Input = encoded
-				tool.InputState = fileInputState(cwd, input)
-				if toolNeedsRepositoryState(toolName, input) {
-					if local := currentRepositoryState(ctx, cwd); local != "" {
-						repositoryState = local
+		if paths, ok := event["workspacePaths"].([]any); ok {
+			for _, rawPath := range paths {
+				if text, ok := rawPath.(string); ok {
+					trimmed := bounded(text, 4096)
+					if trimmed != "" {
+						cwd = trimmed
+						break
 					}
 				}
 			}
+		}
+	}
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	toolCall, _ := event["toolCall"].(map[string]any)
+	toolName := bounded(firstString(event, "tool_name", "toolName", "name"), 160)
+	if toolName == "" && toolCall != nil {
+		toolName = bounded(firstString(toolCall, "name", "tool_name", "toolName"), 160)
+	}
+	tool := &nativeruntime.Tool{Name: toolName}
+	claimedRepositoryState := bounded(firstString(event, "repository_state", "repositoryState"), 512)
+	repositoryState := claimedRepositoryState
+	var toolInput any
+	hasInput := false
+	for _, key := range []string{"tool_input", "toolInput", "args"} {
+		if input, ok := event[key]; ok {
+			toolInput = input
+			hasInput = true
 			break
+		}
+	}
+	if !hasInput && toolCall != nil {
+		for _, key := range []string{"args", "input"} {
+			if input, ok := toolCall[key]; ok {
+				toolInput = input
+				hasInput = true
+				break
+			}
+		}
+	}
+	if hasInput {
+		if encoded, err := json.Marshal(toolInput); err == nil {
+			tool.Input = encoded
+			tool.InputState = fileInputState(cwd, toolInput)
+			if toolNeedsRepositoryState(toolName, toolInput) {
+				if local := currentRepositoryState(ctx, cwd); local != "" {
+					repositoryState = local
+				}
+			}
 		}
 	}
 	mode, profile := nativePolicy(home)
@@ -150,6 +189,9 @@ func toolNeedsRepositoryState(name string, input any) bool {
 	command, _ := values["command"].(string)
 	if command == "" {
 		command, _ = values["cmd"].(string)
+	}
+	if command == "" {
+		command, _ = values["CommandLine"].(string)
 	}
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
@@ -338,7 +380,7 @@ func fileInputState(cwd string, input any) string {
 		return ""
 	}
 	path := ""
-	for _, key := range []string{"path", "file_path", "file", "filename"} {
+	for _, key := range []string{"path", "file_path", "file", "filename", "AbsolutePath", "Path", "TargetFile"} {
 		if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
 			path = value
 			break

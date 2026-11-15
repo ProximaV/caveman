@@ -59,7 +59,7 @@ caveman/
 │
 ├── installer/                   # Unified installer
 │   ├── install.js               # Single source for all 30+ agents (PROVIDERS array)
-│   └── lib/settings.js          # JSONC-tolerant settings.json reader/writer
+│   └── lib/                     # settings.js (JSONC) + native installers (antigravity-native.js, ...)
 │
 ├── skills/                      # ALL skills, single source of truth
 │   ├── caveman/{SKILL.md, README.md}
@@ -75,7 +75,7 @@ caveman/
 ├── commands/                    # Codex/Gemini TOML command stubs (root for plugin auto-discovery)
 │
 ├── src/                         # Internal source — not auto-discovered by plugin
-│   ├── hooks/                   # Claude Code hooks (installer reads here)
+│   ├── hooks/                   # Claude Code + Antigravity hooks (installer reads here)
 │   ├── rules/                   # Auto-activation rule body (single source)
 │   ├── tools/                   # caveman-init.js (per-repo rule writer)
 │   └── mcp-servers/             # caveman-shrink npm-published MCP middleware
@@ -99,6 +99,11 @@ caveman/
 ├── plugins/caveman/             # Claude Code plugin distribution (CI-mirrored)
 │   ├── skills/                  # ← from skills/
 │   └── agents/                  # ← from agents/
+├── plugins/antigravity/         # Antigravity plugin distribution (`agy plugin validate` clean)
+│   ├── plugin.json · hooks.json # Manifest + SessionStart/PreInvocation hooks (no rules/)
+│   ├── hooks/ · assets/         # Mirrored from src/hooks/ and plugins/caveman/assets/
+│   ├── skills/                  # ← 9 skills mirrored from skills/
+│   └── agents/                  # Adapted from agents/cavecrew-*.md (tool names mapped, model stripped)
 │
 ├── dist/                        # Build artifacts (gitignored)
 │   └── caveman.skill            # ZIP of skills/caveman/, rebuilt by CI
@@ -310,7 +315,11 @@ Configured in `settings.json` under `statusLine.command`. PowerShell counterpart
 
 ### `src/hooks/caveman-stats.js --record` — SessionEnd hook
 
-Same script as `/caveman-stats`; the `--record` flag turns it into a silent recorder. Reads the SessionEnd payload (`session_id`, `transcript_path`) and appends one snapshot of that transcript's totals to `$CLAUDE_CONFIG_DIR/.caveman-history.jsonl`, so lifetime history fills in without the user running `/caveman-stats`. Only the transcript the host names is read — never the newest file on disk. Stdin follows the activate-hook contour: first complete JSON object, 2000ms `PAYLOAD_WATCHDOG_MS` (gives up without recording), `unref()` on finish. Always exits 0 and writes nothing to stderr — a SessionEnd failure would surface as a hook error while the user quits. Every installer (plugin manifest, `installer/install.js`, `src/hooks/install.{sh,ps1}`) writes `--record` unquoted after the quoted script path; `rewriteLegacyManagedHookCommands` carries trailing `--flag` args over when it moves a bare-`node` command to the absolute node path.
+Same script as `/caveman-stats`; the `--record` flag turns it into a silent recorder. Reads the SessionEnd payload (`session_id`, `transcript_path`, or Antigravity `conversationId`/`transcriptPath`) and appends one snapshot of that transcript's totals to `.caveman-history.jsonl`, so lifetime history fills in without the user running `/caveman-stats`. Supports `--host claude` (default), `--host gemini` (directs to Gemini's `/stats`), and `--host antigravity` (reads `PLANNER_RESPONSE` rows from Antigravity `transcript.jsonl` files under `$AGY_DATA_DIR/brain` or `~/.gemini/antigravity*/brain`). Only the transcript the host names is read during `--record` — never the newest file on disk. Stdin follows the activate-hook contour: first complete JSON object, 2000ms `PAYLOAD_WATCHDOG_MS` (gives up without recording), `unref()` on finish. Always exits 0 and writes nothing to stderr — a SessionEnd failure would surface as a hook error while the user quits. Every installer (plugin manifest, `installer/install.js`, `src/hooks/install.{sh,ps1}`) writes `--record` unquoted after the quoted script path; `rewriteLegacyManagedHookCommands` carries trailing `--flag` args over when it moves a bare-`node` command to the absolute node path.
+
+### `src/hooks/caveman-antigravity.js` — Antigravity `SessionStart` + `PreInvocation` hook
+
+Single hook adapter for `agy` plugins (`plugins/antigravity/hooks.json`) and workspace `.agents/hooks.json` (`caveman-init --only antigravity --with-hooks`). Handles `SessionStart` (`startup`/`clear` vs `resume`/`compact`) and `PreInvocation`, returning `{ injectSteps: [{ systemMessage: { systemMessage } }] }` (or `{ ephemeralMessage }` when `CAVEMAN_AGY_STEP_FORMAT=ephemeral`). Uses `caveman-config.js` and `caveman-parse.js` for per-session state under `$PLUGIN_DATA`, `<cwd>/.agents/.caveman-state`, or `~/.gemini/config/.caveman-state`, honors `defaultMode` (`off`, `manual`, `caveman`, `ultracave`, `megacave`, one-shots) and `reinforce`, skips tool-loop re-invocations (`invocationNum > 0` with identical `lastUserInput`), deduplicates Turn-1 `SessionStart` + `PreInvocation`, and dispatches `/caveman-stats` via `caveman-stats.js --host antigravity`.
 
 ### `src/hooks/caveman-host-session-start.js` — Cursor / Copilot CLI sessionStart hook
 
@@ -372,8 +381,9 @@ How caveman reaches each agent type:
 | Cline | `npx skills add ... -a cline` (default via `--only cline`); per-repo `.clinerules/caveman.md` via `--with-init` | Yes — Cline auto-discovers `.clinerules/` |
 | Copilot | `npx skills add ... -a github-copilot` (detected via the `copilot` CLI plus its `~/.copilot` dir, since AWS Copilot CLI ships a `copilot` binary too, or the VS Code/Cursor extension); per-repo `.github/copilot-instructions.md` + `AGENTS.md` via `--with-init`. When the Copilot CLI is present (`copilot` on PATH or `$COPILOT_HOME` set — not a bare `~/.copilot`, which `npx skills add -a github-copilot` itself creates) the installer also owns `$COPILOT_HOME/caveman/` (shared hook payload) and `$COPILOT_HOME/hooks/caveman.json` (sessionStart → `caveman-host-session-start.js copilot`); `--no-hooks` skips it. No userPromptSubmitted hook: Copilot drops its output. | Copilot CLI: yes — sessionStart `additionalContext`, honors `defaultMode`. VS Code Copilot Chat: repo-wide instructions via `--with-init` |
 | Grok Build | Owned skill copies into `$GROK_HOME/skills` (default `~/.grok`) plus a marker-fenced ruleset block in `$GROK_HOME/AGENTS.md`, appended/stripped through `installer/lib/openclaw.js`'s marker helpers | Yes — Grok loads `~/.grok/AGENTS.md` as global rules (docs-backed; no live binary run) |
-| Antigravity CLI (`agy`) | `--only antigravity-cli` stages a temp plugin (`plugin.json`, the nine skills, `rules/AGENTS.md` = `src/rules/caveman-activate.md`) and runs `agy plugin install <dir>`; agy copies it to `~/.gemini/config/plugins/caveman/` and owns it. Uninstall: `agy plugin uninstall caveman` when `agy plugin list` names it. No session-start hook exists in agy (PreInvocation fires before every model call), so no `defaultMode`. | Yes — plugin `rules/AGENTS.md` merges into agy's active rule set (verified agy 1.2.17) |
-| Continue, AiderDesk, Antigravity IDE/2.0 | Owned physical copies into each vendor's supported directory, honoring configured homes; separate explicit targets for the two Antigravity products | Host skill invocation; feature settings may be required |
+| Antigravity CLI (`agy`) | `--only antigravity-cli` stages a plugin (`plugin.json`, `assets/caveman.svg`, 9 skills, 3 adapted `agents/`, `hooks.json` + `src/hooks/caveman-antigravity.js` & `caveman-stats.js`, and no `rules/`) via `installer/lib/antigravity-native.js` and runs `agy plugin install <dir>`; `agy` copies it to `~/.gemini/config/plugins/caveman/` and owns it. `--no-hooks` / `--minimal` (or Bun without Node >=18) falls back to static `rules/AGENTS.md` without hooks. Uninstall: `agy plugin uninstall caveman` when `agy plugin list` names it. | Yes — `SessionStart` + `PreInvocation` hooks honor `defaultMode`, `reinforce`, mid-session switches, `/caveman-stats`, and `stop caveman` (`--no-hooks` falls back to static `rules/AGENTS.md`) |
+| Antigravity IDE / 2.0 | Owned skill copies into `~/.gemini/antigravity/skills` (`antigravity`) or `~/.gemini/config/skills` (`antigravity-2`), skipped when redundant after the unified `agy` plugin is present (unless `--force`); workspace `.agents/rules/caveman.md` or hooked `.agents/hooks.json` via `caveman-init --only antigravity [--with-hooks]` | Per-session skill invocation globally; always-on rule or dynamic hooks in initialized workspaces |
+| Continue, AiderDesk | Owned physical copies into each vendor's supported directory, honoring configured homes | Host skill invocation; feature settings may be required |
 | Others (Junie, Trae, Warp, Tabnine, Mistral, Qwen, Devin, Droid, ForgeCode, Bob, Crush, iFlow, OpenHands, Qoder, Rovo Dev, Replit, …) | Delegated `npx skills` personal installs; Replit uses project scope. Configured iFlow/Crush roots use owned copies | Host skill invocation; `/caveman` where supported |
 
 opencode reaches Tier 1 minus the statusline (opencode's TUI has no plugin-writable badge). Mode flag lives at `$OPENCODE_CONFIG_DIR/.caveman-active` — default `~/.config/opencode/.caveman-active` — for any external tooling that wants to surface it. All three opencode roots (CLI, installer, copied plugin) resolve `OPENCODE_CONFIG_DIR` first, then `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`; they cannot share one function (compiled Bun plugin, dependency-free installer), so a test pins the order on each (#1441).

@@ -4,15 +4,28 @@
 #
 # Usage in ~/.claude/settings.json:
 #   "statusLine": { "type": "command", "command": "bash /path/to/caveman-statusline.sh" }
+# Usage in ~/.gemini/antigravity-cli/settings.json:
+#   "statusLine": { "type": "command", "command": "bash /path/to/caveman-statusline.sh --host antigravity", "stack_with_default": true }
 #
 # Plugin users: Claude will offer to set this up on first session.
 # Standalone users: install.sh wires this automatically.
 
-CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CFG="${CLAUDE_CONFIG_DIR:-${PLUGIN_DATA:-$HOME/.claude}}"
+if [ -z "$CLAUDE_CONFIG_DIR" ] && [ -z "$PLUGIN_DATA" ] && [ "${1:-}" = "--host" ] && [ "${2:-}" = "antigravity" ]; then
+  if [ -d "$PWD/.agents" ]; then
+    CFG="$PWD/.agents/.caveman-state"
+  elif [ -d "$HOME/.gemini/antigravity-cli/plugin_data/caveman" ]; then
+    CFG="$HOME/.gemini/antigravity-cli/plugin_data/caveman"
+  elif [ -d "$HOME/.gemini/antigravity/plugin_data/caveman" ]; then
+    CFG="$HOME/.gemini/antigravity/plugin_data/caveman"
+  else
+    CFG="$HOME/.gemini/config/.caveman-state"
+  fi
+fi
 
-# Claude Code sends session JSON on stdin, including session_id. We use it to
-# read THIS window's mode instead of a machine-wide flag — otherwise every
-# window renders whichever mode was set last.
+# Claude Code / Antigravity send session JSON on stdin (session_id or conversationId).
+# We use it to read THIS window's mode instead of a machine-wide flag — otherwise
+# every window renders whichever mode was set last.
 #
 # Reading stdin must never wedge the status bar, so two guards:
 #   1. `[ -t 0 ]` — a real terminal (someone running this by hand) is never
@@ -30,6 +43,12 @@ if [ ! -t 0 ]; then
     | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' \
     | head -1 \
     | sed -e 's/.*:[[:space:]]*"//' -e 's/"$//')
+  if [ -z "$SESSION_ID" ]; then
+    SESSION_ID=$(printf '%s' "$CAVEMAN_STDIN" \
+      | grep -o '"conversationId"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -1 \
+      | sed -e 's/.*:[[:space:]]*"//' -e 's/"$//')
+  fi
 fi
 
 # The id becomes part of a path, so whitelist its alphabet AND cap its length —

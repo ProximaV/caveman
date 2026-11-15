@@ -326,6 +326,12 @@ function findAgent(requested: string): AgentProfile | undefined {
   return AGENTS.find((a) => a.id === requested || a.binary_names.includes(requested));
 }
 
+const ANTIGRAVITY_ALIASES = new Set(["antigravity", "agy", "antigravity-cli", "antigravity-ide"]);
+
+function isAntigravityTarget(name?: string): boolean {
+  return Boolean(name && ANTIGRAVITY_ALIASES.has(name.trim().toLowerCase()));
+}
+
 type CommandGroup = "tools" | "cloud";
 type CommandHandler = (argv: string[]) => unknown | Promise<unknown>;
 type ResolvedInvocation = {
@@ -534,7 +540,10 @@ const LEGACY_HANDLERS: Record<string, CommandHandler> = {
   // The port moves only for an agent that routes through the runtime and is
   // on PATH: help, a typo or aider never touch it.
   enable: async (argv) => {
-    if (enableProfiles(argv).profiles.some((profile) => profile.id !== "aider" && which(binOf(profile)))) await claimRuntimePort();
+    const antigravityArg = !argv.includes("--detected") ? argv.find((arg) => !arg.startsWith("--")) : undefined;
+    if (!isAntigravityTarget(antigravityArg) && enableProfiles(argv).profiles.some((profile) => profile.id !== "aider" && which(binOf(profile)))) {
+      await claimRuntimePort();
+    }
     enableNative(argv);
   },
   disable: (argv) => disableNative(argv),
@@ -732,6 +741,14 @@ setModuleHost({
   confirm: promptYesNo,
   agentTraffic,
   agentStaleRoute,
+  antigravityDoctor: () => {
+    const report = antigravityDoctorCheck(false);
+    return {
+      configured: report.configured,
+      failures: report.failures,
+      notes: report.warnings,
+    };
+  },
 });
 
 function commandUsage(suffix: string): never {
@@ -779,6 +796,9 @@ function resolveInvocation(raw: string[]): ResolvedInvocation {
   }
   const handler = LEGACY_HANDLERS[top];
   if (handler) return { verb: top, argv: raw.slice(1), handler };
+  if (isAntigravityTarget(top)) {
+    return { verb: "wrap", argv: raw, handler: () => failClosedAntigravityWrap() };
+  }
   const agent = RESERVED_VERBS.has(top) ? undefined : findAgent(top);
   if (agent) return {
     verb: "run",
@@ -5930,6 +5950,9 @@ async function wrap(rest: string[]) {
     process.exit(2);
   }
   const requested = rest[0]!;
+  if (isAntigravityTarget(requested)) {
+    failClosedAntigravityWrap();
+  }
   const agent = findAgent(requested);
   const bin = agent ? binOf(agent) : requested;
   const extra = agent ? [...agent.args, ...rest.slice(1)] : rest.slice(1);
@@ -10853,9 +10876,586 @@ function enableProfiles(argv: string[]): { detected: boolean; profiles: AgentPro
   return { detected, profiles };
 }
 
+function antigravityConfigDir(): string {
+  return join(homedir(), ".gemini", "config");
+}
+
+function antigravityHooksPath(): string {
+  return join(antigravityConfigDir(), "hooks.json");
+}
+
+function antigravityMcpConfigPath(): string {
+  return join(antigravityConfigDir(), "mcp_config.json");
+}
+
+function antigravityPluginDir(): string {
+  return join(antigravityConfigDir(), "plugins", "caveman");
+}
+
+function resolveAgyBin(): { bin: string | null; onPath: boolean; fallbackPath: string | null } {
+  const onPath = which("agy");
+  if (onPath) return { bin: onPath, onPath: true, fallbackPath: null };
+  const binDir = join(homedir(), ".gemini", "bin");
+  const candidates = process.platform === "win32"
+    ? [join(binDir, "agy.exe"), join(binDir, "agy.cmd"), join(binDir, "agy")]
+    : [join(binDir, "agy"), join(binDir, "agy.exe")];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) {
+        return { bin: candidate, onPath: false, fallbackPath: candidate };
+      }
+    } catch { /* absent */ }
+  }
+  return { bin: null, onPath: false, fallbackPath: null };
+}
+
+function failClosedAntigravityWrap(): never {
+  console.error(
+    [
+      "caveman: Antigravity does not use an HTTP proxy wrapper (`caveman wrap`).",
+      "  Antigravity (agy CLI + IDE) connects to Google endpoints over an internal channel",
+      "  and integrates with Caveman natively via hooks, MCP, and the caveman plugin:",
+      "",
+      "  • Enable native hooks + MCP:  caveman enable antigravity",
+      "  • Install command shrinker:   caveman hooks install antigravity",
+      "  • Install memory recall hook: caveman mem hook install antigravity",
+      "  • Install MCP server:         caveman mcp install antigravity",
+      "  • Install caveman plugin:     npx caveman-install --antigravity-cli",
+      "  • Check integration health:   caveman doctor antigravity",
+    ].join("\n"),
+  );
+  process.exit(1);
+}
+
+function readAntigravityJsoncObject(path: string): { exists: boolean; raw: string; root: Record<string, unknown> } {
+  let raw = "";
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false, raw: "", root: {} };
+    throw error;
+  }
+  const stripped = raw.replace(/^\uFEFF/, "").trim();
+  if (!stripped) return { exists: true, raw, root: {} };
+  const parsed = parseJsonc(stripped);
+  if (!isPlainObject(parsed)) {
+    throw new Error(`${path} is not a JSON object`);
+  }
+  return { exists: true, raw, root: parsed };
+}
+
+function installAntigravityNamedHook(groupName: string, groupSpec: Record<string, unknown>): string | null {
+  const path = antigravityHooksPath();
+  let state: { exists: boolean; raw: string; root: Record<string, unknown> };
+  try {
+    state = readAntigravityJsoncObject(path);
+  } catch (error) {
+    console.error(`${mark("warn")} ${(error as Error).message}; not modifying it`);
+    return null;
+  }
+  state.root[groupName] = groupSpec;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    if (state.raw) keepJsoncOriginal(path, state.raw);
+    writeFileSync(path, JSON.stringify(state.root, null, 2) + "\n", "utf8");
+    return path;
+  } catch (error) {
+    console.error(`${mark("warn")} cannot write ${path}: ${(error as Error).message}`);
+    return null;
+  }
+}
+
+function removeAntigravityNamedHook(groupName: string): boolean {
+  const path = antigravityHooksPath();
+  let state: { exists: boolean; raw: string; root: Record<string, unknown> };
+  try {
+    state = readAntigravityJsoncObject(path);
+  } catch (error) {
+    console.error(`${mark("warn")} ${(error as Error).message}; not modifying it`);
+    return false;
+  }
+  if (!state.exists || !Object.prototype.hasOwnProperty.call(state.root, groupName)) return false;
+  delete state.root[groupName];
+  try {
+    keepJsoncOriginal(path, state.raw);
+    writeFileSync(path, JSON.stringify(state.root, null, 2) + "\n", "utf8");
+    return true;
+  } catch (error) {
+    console.error(`${mark("warn")} cannot write ${path}: ${(error as Error).message}`);
+    return false;
+  }
+}
+
+function installShrinkHookAntigravity(): string | null {
+  // Antigravity spawns command hooks with `cmd /c` on Windows, never PowerShell `&`.
+  const command = `${cavemanBinForHook(false)} shrink-hook`;
+  const dest = installAntigravityNamedHook("caveman-shrink", {
+    PreToolUse: [
+      {
+        matcher: "run_command",
+        hooks: [{ type: "command", command, timeout: 10 }],
+      },
+    ],
+  });
+  if (dest) writeShrinkHookMarker("antigravity");
+  return dest;
+}
+
+function removeShrinkHookAntigravity(): boolean {
+  const removed = removeAntigravityNamedHook("caveman-shrink");
+  const hadMarker = shrinkHookInstalled("antigravity");
+  try { unlinkSync(shrinkHookMarkerPath("antigravity")); } catch { /* no marker */ }
+  return removed || hadMarker;
+}
+
+function installRecallHookAntigravity(): string | null {
+  const command = `${cavemanBinForHook(false)} mem recall-hook`;
+  const dest = installAntigravityNamedHook("caveman-recall", {
+    PreInvocation: [{ type: "command", command, timeout: 10 }],
+  });
+  if (dest) writeRecallHookMarker("antigravity");
+  return dest;
+}
+
+function removeRecallHookAntigravity(): boolean {
+  const removed = removeAntigravityNamedHook("caveman-recall");
+  const hadMarker = recallHookInstalled("antigravity");
+  try { unlinkSync(recallHookMarkerPath("antigravity")); } catch { /* no marker */ }
+  return removed || hadMarker;
+}
+
+function tokenizeHookCommand(cmd: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (current) { tokens.push(current); current = ""; }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+const ANTIGRAVITY_HOOK_SUBCOMMAND_RE = /\b(session-start|pre-invocation|pre-compact|post-response|pre-tool-use)\b/i;
+
+function antigravityCommandProblems(
+  cmd: string,
+  baseDir?: string,
+): { broken: boolean; reason?: string | undefined; subcommand?: string | undefined } {
+  const trimmed = cmd.trim();
+  const subcommand = trimmed.match(ANTIGRAVITY_HOOK_SUBCOMMAND_RE)?.[1];
+  if (!trimmed) return { broken: true, reason: "empty hook command" };
+  if (trimmed.startsWith("& ")) {
+    return { broken: true, reason: "uses PowerShell '&' operator (invalid under Antigravity cmd /c)", subcommand };
+  }
+  if (/\\"/.test(trimmed)) {
+    return { broken: true, reason: "contains nested escaped quotes (\\\") that break Windows cmd /c", subcommand };
+  }
+  const tokens = tokenizeHookCommand(trimmed);
+  if (tokens.length === 0) return { broken: true, reason: "unparseable hook command" };
+  const exe = tokens[0]!;
+  if ((isAbsolute(exe) || /[\\/]/.test(exe)) && !existsSync(exe)) {
+    return { broken: true, reason: `missing executable: ${exe}`, subcommand };
+  }
+  const maybeScript = tokens[1];
+  if (maybeScript && /\.[cm]?js$/i.test(maybeScript)) {
+    const resolvedScript = baseDir && !isAbsolute(maybeScript) ? resolve(baseDir, maybeScript) : maybeScript;
+    if ((isAbsolute(resolvedScript) || /[\\/]/.test(maybeScript)) && !existsSync(resolvedScript)) {
+      return { broken: true, reason: `missing hook script: ${maybeScript}`, subcommand };
+    }
+  }
+  return { broken: false };
+}
+
+function walkAntigravityHookHandlers(
+  node: unknown,
+  visit: (handler: Record<string, unknown>) => void,
+): void {
+  if (Array.isArray(node)) {
+    for (const item of node) walkAntigravityHookHandlers(item, visit);
+    return;
+  }
+  if (!isPlainObject(node)) return;
+  if (node.type === "command" && typeof node.command === "string") {
+    visit(node);
+    return;
+  }
+  for (const val of Object.values(node)) walkAntigravityHookHandlers(val, visit);
+}
+
+function spawnAgySync(agyBin: string, args: string[]) {
+  const invocation = portableInvocation(agyBin, args);
+  return spawnSync(invocation.command, invocation.args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5000,
+    windowsHide: true,
+  });
+}
+
+function queryAgyPluginEnabled(agyBin: string): { queried: boolean; listed: boolean; enabled: boolean; error?: string } {
+  const res = spawnAgySync(agyBin, ["plugin", "list", "--json"]);
+  if (res.error || res.status !== 0) {
+    return { queried: false, listed: false, enabled: false, error: res.error?.message ?? (res.stderr?.trim() || `exit ${res.status}`) };
+  }
+  try {
+    const parsed = JSON.parse((res.stdout || "[]").replace(/^\uFEFF/, ""));
+    const items = Array.isArray(parsed)
+      ? parsed
+      : isPlainObject(parsed) && Array.isArray(parsed.plugins)
+        ? parsed.plugins
+        : [];
+    const entry = items.find((item) => {
+      if (!isPlainObject(item)) return false;
+      const id = typeof item.id === "string" ? item.id : "";
+      const name = typeof item.name === "string" ? item.name : "";
+      return name === "caveman" || id === "caveman" || id.startsWith("caveman@");
+    });
+    if (!isPlainObject(entry)) return { queried: true, listed: false, enabled: false };
+    return { queried: true, listed: true, enabled: entry.enabled !== false };
+  } catch (error) {
+    return { queried: false, listed: false, enabled: false, error: (error as Error).message };
+  }
+}
+
+function runAgyPluginToggle(agyBin: string, action: "enable" | "disable"): { ok: boolean; error?: string } {
+  for (const target of ["caveman@local", "caveman"]) {
+    const res = spawnAgySync(agyBin, ["plugin", action, target]);
+    if (!res.error && res.status === 0) return { ok: true };
+  }
+  return { ok: false, error: `agy plugin ${action} caveman@local failed` };
+}
+
+type AntigravityDoctorReport = {
+  configured: boolean;
+  ok: boolean;
+  lines: string[];
+  warnings: string[];
+  failures: string[];
+  actions: string[];
+};
+
+function antigravityDoctorCheck(fix = false): AntigravityDoctorReport {
+  // Never read or write ~/.gemini/config/config.json (0600); inspect/manage plugin
+  // activation exclusively via `agy plugin`.
+  const lines: string[] = [];
+  const warnings: string[] = [];
+  const failures: string[] = [];
+  const actions: string[] = [];
+
+  const pluginDir = antigravityPluginDir();
+  const hooksPath = antigravityHooksPath();
+  const mcpPath = antigravityMcpConfigPath();
+  const hasPluginDir = existsSync(pluginDir);
+
+  let hasCavemanHooksEntry = shrinkHookInstalled("antigravity") || recallHookInstalled("antigravity");
+  if (existsSync(hooksPath)) {
+    try {
+      const hState = readAntigravityJsoncObject(hooksPath);
+      if ("caveman-shrink" in hState.root || "caveman-recall" in hState.root) hasCavemanHooksEntry = true;
+    } catch {
+      hasCavemanHooksEntry = true;
+    }
+  }
+
+  let hasCavemanMcpEntry = ["caveman", "caveman-browse", "caveman-cloud", "caveman-delegate"].some((s) => mcpServerInstalled("antigravity", s));
+  if (!hasCavemanMcpEntry && existsSync(mcpPath)) {
+    try {
+      const mState = readAntigravityJsoncObject(mcpPath);
+      const servers = isPlainObject(mState.root.mcpServers) ? mState.root.mcpServers : {};
+      if ("caveman" in servers || "caveman-browse" in servers || "caveman-cloud" in servers || "caveman-delegate" in servers) {
+        hasCavemanMcpEntry = true;
+      }
+    } catch {
+      hasCavemanMcpEntry = true;
+    }
+  }
+
+  const configured = hasPluginDir || hasCavemanHooksEntry || hasCavemanMcpEntry;
+
+  // 1. agy binary discovery
+  const agy = resolveAgyBin();
+  if (agy.bin && agy.onPath) {
+    lines.push(`${mark("ok")} agy CLI: ${agy.bin}`);
+  } else if (agy.bin && !agy.onPath && agy.fallbackPath) {
+    const msg = `agy CLI found at ${agy.fallbackPath} (not on PATH; add ${dirname(agy.fallbackPath)} to PATH)`;
+    lines.push(`${mark("warn")} ${msg}`);
+    warnings.push(msg);
+  } else {
+    lines.push("- agy CLI: not detected");
+  }
+
+  // 2. Caveman plugin at ~/.gemini/config/plugins/caveman
+  if (hasPluginDir) {
+    const manifestPath = join(pluginDir, "plugin.json");
+    if (!existsSync(manifestPath)) {
+      const msg = `antigravity plugin manifest missing at ${manifestPath}`;
+      lines.push(`${mark("bad")} ${msg}`);
+      failures.push(msg);
+    } else {
+      try {
+        readAntigravityJsoncObject(manifestPath);
+        lines.push(`${mark("ok")} plugin manifest: ${manifestPath}`);
+      } catch (error) {
+        const msg = `antigravity plugin manifest invalid: ${(error as Error).message}`;
+        lines.push(`${mark("bad")} ${msg}`);
+        failures.push(msg);
+      }
+    }
+
+    const pluginHooksPath = join(pluginDir, "hooks.json");
+    const localHookScript = join(pluginDir, "hooks", "caveman-antigravity.js");
+    if (existsSync(pluginHooksPath)) {
+      try {
+        const phState = readAntigravityJsoncObject(pluginHooksPath);
+        let pluginHooksDirty = false;
+        const pluginProblems: string[] = [];
+        walkAntigravityHookHandlers(phState.root, (handler) => {
+          const check = antigravityCommandProblems(String(handler.command), pluginDir);
+          if (!check.broken) return;
+          if (fix && existsSync(localHookScript)) {
+            const sub = check.subcommand || String(handler.command).match(ANTIGRAVITY_HOOK_SUBCOMMAND_RE)?.[1] || "";
+            handler.command = `"${process.execPath}" "${localHookScript}"${sub ? ` ${sub}` : ""}`;
+            pluginHooksDirty = true;
+            return;
+          }
+          pluginProblems.push(check.reason ?? "invalid hook command");
+        });
+        if (pluginHooksDirty) {
+          keepJsoncOriginal(pluginHooksPath, phState.raw);
+          writeFileSync(pluginHooksPath, JSON.stringify(phState.root, null, 2) + "\n", "utf8");
+          actions.push(`repaired plugin hooks at ${pluginHooksPath}`);
+          lines.push(`${mark("ok")} plugin hooks repaired: ${pluginHooksPath}`);
+        } else if (pluginProblems.length > 0) {
+          const msg = `antigravity plugin hooks.json broken (${pluginProblems.join("; ")}) · fix: caveman doctor antigravity --fix`;
+          lines.push(`${mark("bad")} ${msg}`);
+          failures.push(msg);
+        } else {
+          lines.push(`${mark("ok")} plugin hooks: ${pluginHooksPath}`);
+        }
+      } catch (error) {
+        const msg = `antigravity plugin hooks.json invalid: ${(error as Error).message}`;
+        lines.push(`${mark("bad")} ${msg}`);
+        failures.push(msg);
+      }
+    }
+
+    if (agy.bin) {
+      let status = queryAgyPluginEnabled(agy.bin);
+      if (fix && status.queried && (!status.listed || !status.enabled)) {
+        const toggled = runAgyPluginToggle(agy.bin, "enable");
+        if (toggled.ok) {
+          actions.push("enabled caveman@local via agy plugin enable");
+          status = queryAgyPluginEnabled(agy.bin);
+        }
+      }
+      if (!status.queried) {
+        const msg = `agy plugin list --json failed (${status.error ?? "unknown error"})`;
+        lines.push(`${mark("warn")} ${msg}`);
+        warnings.push(msg);
+      } else if (!status.listed) {
+        const msg = "caveman plugin dir exists but is not registered in agy plugin list (run: npx caveman-install --antigravity-cli)";
+        lines.push(`${mark("warn")} ${msg}`);
+        warnings.push(msg);
+      } else if (!status.enabled) {
+        const msg = "caveman plugin is disabled in agy (run: agy plugin enable caveman@local)";
+        lines.push(`${mark("bad")} ${msg}`);
+        failures.push(msg);
+      } else {
+        lines.push(`${mark("ok")} agy plugin list: caveman enabled`);
+      }
+    }
+  } else {
+    lines.push(`- plugin dir not present (${pluginDir})`);
+  }
+
+  // 3. Global ~/.gemini/config/hooks.json (caveman-shrink, caveman-recall)
+  let hooksRoot: Record<string, unknown> | null = null;
+  let hooksCorrupt = false;
+  if (existsSync(hooksPath)) {
+    try {
+      hooksRoot = readAntigravityJsoncObject(hooksPath).root;
+    } catch (error) {
+      hooksCorrupt = true;
+      const msg = `antigravity hooks.json invalid (${(error as Error).message})`;
+      lines.push(`${mark("bad")} ${msg}`);
+      failures.push(msg);
+    }
+  }
+  if (!hooksCorrupt) {
+    const shrinkGroup = hooksRoot?.["caveman-shrink"];
+    const recallGroup = hooksRoot?.["caveman-recall"];
+    const shrinkProblems: string[] = [];
+    if (shrinkGroup !== undefined) {
+      walkAntigravityHookHandlers(shrinkGroup, (handler) => {
+        const check = antigravityCommandProblems(String(handler.command));
+        if (check.broken) shrinkProblems.push(check.reason ?? "invalid command");
+      });
+    }
+    if ((shrinkGroup === undefined || shrinkProblems.length > 0) && fix) {
+      const repaired = installShrinkHookAntigravity();
+      if (repaired) {
+        actions.push(`installed caveman-shrink in ${repaired}`);
+        lines.push(`${mark("ok")} global hooks: caveman-shrink installed (${repaired})`);
+      }
+    } else if (shrinkGroup === undefined) {
+      const msg = "caveman-shrink hook not configured in ~/.gemini/config/hooks.json (fix: caveman hooks install antigravity)";
+      lines.push(`${mark("warn")} ${msg}`);
+      warnings.push(msg);
+    } else if (shrinkProblems.length > 0) {
+      const msg = `caveman-shrink hook broken (${shrinkProblems.join("; ")}) · fix: caveman doctor antigravity --fix`;
+      lines.push(`${mark("bad")} ${msg}`);
+      failures.push(msg);
+    } else {
+      lines.push(`${mark("ok")} global hooks: caveman-shrink configured`);
+    }
+
+    if (recallGroup !== undefined) {
+      const recallProblems: string[] = [];
+      walkAntigravityHookHandlers(recallGroup, (handler) => {
+        const check = antigravityCommandProblems(String(handler.command));
+        if (check.broken) recallProblems.push(check.reason ?? "invalid command");
+      });
+      if (recallProblems.length > 0 && fix) {
+        const repaired = installRecallHookAntigravity();
+        if (repaired) {
+          actions.push(`repaired caveman-recall in ${repaired}`);
+          lines.push(`${mark("ok")} global hooks: caveman-recall repaired`);
+        }
+      } else if (recallProblems.length > 0) {
+        const msg = `caveman-recall hook broken (${recallProblems.join("; ")}) · fix: caveman doctor antigravity --fix`;
+        lines.push(`${mark("bad")} ${msg}`);
+        failures.push(msg);
+      } else {
+        lines.push(`${mark("ok")} global hooks: caveman-recall configured`);
+      }
+    }
+  }
+
+  // 4. Global ~/.gemini/config/mcp_config.json + legacy .ide_migration
+  let mcpCorrupt = false;
+  let mcpServers: Record<string, unknown> = {};
+  if (existsSync(mcpPath)) {
+    try {
+      const mState = readAntigravityJsoncObject(mcpPath);
+      if (isPlainObject(mState.root.mcpServers)) mcpServers = mState.root.mcpServers;
+    } catch (error) {
+      mcpCorrupt = true;
+      const msg = `antigravity mcp_config.json invalid (${(error as Error).message})`;
+      lines.push(`${mark("bad")} ${msg}`);
+      failures.push(msg);
+    }
+  }
+  if (!mcpCorrupt) {
+    const cavemanMcp = mcpServers.caveman;
+    let mcpBroken = false;
+    if (isPlainObject(cavemanMcp) && typeof cavemanMcp.command === "string") {
+      if ((isAbsolute(cavemanMcp.command) || /[\\/]/.test(cavemanMcp.command)) && !existsSync(cavemanMcp.command)) {
+        mcpBroken = true;
+      }
+    }
+    if ((!cavemanMcp || mcpBroken) && fix) {
+      const dest = installMcpAntigravity("caveman", resolveMcpCommand());
+      if (dest) {
+        actions.push(`installed caveman MCP server in ${dest}`);
+        lines.push(`${mark("ok")} MCP config: caveman installed (${dest})`);
+      }
+    } else if (!cavemanMcp) {
+      const msg = "caveman MCP server not configured in ~/.gemini/config/mcp_config.json (fix: caveman mcp install antigravity)";
+      lines.push(`${mark("warn")} ${msg}`);
+      warnings.push(msg);
+    } else if (mcpBroken) {
+      const msg = `caveman MCP command points to missing executable (${String((cavemanMcp as Record<string, unknown>).command)}) · fix: caveman doctor antigravity --fix`;
+      lines.push(`${mark("bad")} ${msg}`);
+      failures.push(msg);
+    } else {
+      lines.push(`${mark("ok")} MCP config: caveman configured (${mcpPath})`);
+    }
+  }
+
+  const legacyIdeDir = join(homedir(), ".gemini", "antigravity-ide");
+  if (existsSync(join(legacyIdeDir, "mcp_config.json")) && !existsSync(join(legacyIdeDir, ".ide_migration"))) {
+    const msg = `legacy ${join(legacyIdeDir, "mcp_config.json")} found without .ide_migration; Antigravity reads ${mcpPath}`;
+    lines.push(`${mark("warn")} ${msg}`);
+    warnings.push(msg);
+  }
+
+  return {
+    configured,
+    ok: failures.length === 0,
+    lines,
+    warnings,
+    failures,
+    actions,
+  };
+}
+
+function enableAntigravity(quiet = false): void {
+  const hooksDest = installShrinkHookAntigravity();
+  const mcpDest = installMcpAntigravity("caveman", resolveMcpCommand());
+  const agy = resolveAgyBin();
+  if (agy.bin && existsSync(antigravityPluginDir())) {
+    runAgyPluginToggle(agy.bin, "enable");
+  }
+  if (!hooksDest || !mcpDest) {
+    process.exitCode = 1;
+    return;
+  }
+  if (!quiet) {
+    process.stderr.write(`${mark("ok")} Antigravity: caveman-shrink hook → ${hooksDest}\n`);
+    process.stderr.write(`${mark("ok")} Antigravity: caveman MCP → ${mcpDest}\n`);
+    if (agy.bin && existsSync(antigravityPluginDir())) {
+      process.stderr.write(`${mark("ok")} Antigravity: caveman plugin enabled via ${agy.bin}\n`);
+    } else if (!existsSync(antigravityPluginDir())) {
+      process.stderr.write(dim("→ to install full plugin skills/hooks, run: npx caveman-install --antigravity-cli\n"));
+    }
+  }
+}
+
+function disableAntigravity(quiet = false): void {
+  const removedShrink = removeShrinkHookAntigravity();
+  const removedRecall = removeRecallHookAntigravity();
+  const removedMcp = uninstallMcpAntigravity("caveman");
+  const agy = resolveAgyBin();
+  let disabledPlugin = false;
+  if (agy.bin && existsSync(antigravityPluginDir())) {
+    disabledPlugin = runAgyPluginToggle(agy.bin, "disable").ok;
+  }
+  if (!quiet) {
+    if (removedShrink || removedRecall || removedMcp || disabledPlugin) {
+      process.stderr.write(`${mark("ok")} Antigravity: Caveman hooks and MCP disabled\n`);
+    } else {
+      process.stderr.write("- Antigravity: nothing to disable\n");
+    }
+  }
+}
+
+function antigravityDoctor(fix: boolean): void {
+  const report = antigravityDoctorCheck(fix);
+  for (const line of report.lines) console.log(line);
+  if (!report.ok) process.exitCode = 1;
+}
+
 // `quiet` is for module apply (onboarding, `caveman on|off`), which prints one
 // progress line per step itself; refusals still throw with their full message.
 function enableNative(argv: string[], { quiet = false }: { quiet?: boolean } = {}) {
+  const antigravityArg = argv.find((arg) => !arg.startsWith("--"));
+  if (antigravityArg && isAntigravityTarget(antigravityArg) && !argv.includes("--detected")) {
+    if (argv.some((arg) => arg !== antigravityArg)) {
+      commandUsage("enable <claude|codex|hermes|gemini|opencode|pi|aider> | enable --detected");
+    }
+    enableAntigravity(quiet);
+    return;
+  }
   const { detected, profiles } = enableProfiles(argv);
   const gw = gatewayURL();
   for (const profile of profiles) {
@@ -11574,10 +12174,17 @@ function disableNative(argv: string[]) {
         process.stderr.write(`${mark("bad")} ${target}: ${(error as Error).message}\n`);
       }
     }
+    if (shrinkHookInstalled("antigravity") || recallHookInstalled("antigravity") || mcpServerInstalled("antigravity", "caveman")) {
+      disableAntigravity(true);
+    }
     if (failed > 0) process.exitCode = 1;
     return;
   }
   const target = argv[0];
+  if (target && isAntigravityTarget(target) && argv.length === 1) {
+    disableAntigravity(false);
+    return;
+  }
   if ((target !== "claude" && target !== "codex" && target !== "hermes" && target !== "gemini" && target !== "opencode" && target !== "pi" && target !== "aider") || argv.length !== 1) commandUsage("disable <claude|codex|hermes|gemini|opencode|pi|aider> | disable --all");
   disableNativeAgent(target, { allClaudeProfiles: true });
 }
@@ -11867,6 +12474,10 @@ function genericIntegrationStatus(runtimeReachable: boolean) {
 async function nativeDoctor(argv: string[]) {
   const fix = argv.includes("--fix");
   const target = argv.find((arg) => arg !== "--fix");
+  if (target && isAntigravityTarget(target) && argv.length === (fix ? 2 : 1)) {
+    antigravityDoctor(fix);
+    return;
+  }
   if ((target !== "claude" && target !== "codex" && target !== "hermes" && target !== "gemini" && target !== "opencode" && target !== "pi" && target !== "aider" && target !== "generic") || argv.length !== (fix ? 2 : 1) || (fix && target === "generic")) commandUsage("doctor [<claude|codex|hermes|gemini|opencode|pi|aider|generic> [--fix]]");
   if (target === "generic") {
     const { host, port } = gatewayHostPort();
@@ -14740,6 +15351,48 @@ function mcpUsage(): never {
   process.exit(2);
 }
 
+function antigravityMcpServerPresent(serverName: string): boolean {
+  try {
+    const state = readAntigravityJsoncObject(antigravityMcpConfigPath());
+    const servers = state.root.mcpServers;
+    return isPlainObject(servers) && Object.prototype.hasOwnProperty.call(servers, serverName);
+  } catch {
+    return false;
+  }
+}
+
+function mcpToolLabel(serverName: string): string {
+  return serverName === "caveman"
+    ? "caveman_retrieve"
+    : serverName === "caveman-browse"
+      ? "caveman_browse"
+      : serverName === "caveman-delegate"
+        ? "caveman_delegate"
+        : "caveman_context";
+}
+
+function installMcpAntigravity(serverName: string, mcp: { command: string; args: string[] }): string | null {
+  preflightMcpServerMarker("antigravity", serverName);
+  const dest = antigravityMcpConfigPath();
+  if (!installMcpJson(dest, ["mcpServers", serverName], { command: mcp.command, args: mcp.args }, false)) {
+    return null;
+  }
+  if (serverName === "caveman") writeMcpMarker("antigravity", mcp);
+  else writeMcpServerMarker("antigravity", serverName, mcp, mcpToolLabel(serverName));
+  return dest;
+}
+
+function uninstallMcpAntigravity(serverName: string): boolean {
+  const hadConfig = antigravityMcpServerPresent(serverName);
+  const hadMarker = mcpServerInstalled("antigravity", serverName);
+  if (!removeMcpJson(antigravityMcpConfigPath(), ["mcpServers", serverName], false)) {
+    process.exitCode = 1;
+    return false;
+  }
+  durableUnlink(mcpServerMarkerPath("antigravity", serverName));
+  return hadConfig || hadMarker;
+}
+
 // mcpUninstall reverses mcpInstall: de-register the caveman MCP server from the
 // agent's config and drop the marker, so wrap stops signaling MCP recovery.
 function mcpUninstall(target?: string, serverName = "caveman") {
@@ -14747,7 +15400,17 @@ function mcpUninstall(target?: string, serverName = "caveman") {
     console.error(`unknown MCP server '${serverName}'. valid: caveman, caveman-browse, caveman-cloud, caveman-delegate`);
     process.exit(2);
   }
+  if (target && isAntigravityTarget(target)) {
+    const removed = uninstallMcpAntigravity(serverName);
+    if (removed) {
+      process.stderr.write(`${mark("ok")} Antigravity: ${serverName} MCP tool removed\n`);
+    } else if (!process.exitCode) {
+      process.stderr.write(`- Antigravity: nothing to remove\n`);
+    }
+    return;
+  }
   let targets: AgentProfile[];
+  const antigravityInstalled = !target && mcpServerInstalled("antigravity", serverName);
   if (target) {
     const a = findAgent(target);
     if (!a) {
@@ -14761,7 +15424,7 @@ function mcpUninstall(target?: string, serverName = "caveman") {
         existsSync(mcpPendingJournalPath(a.id, serverName))
         || existsSync(mcpConfigPendingJournalPath(a.id === "kilo" ? kiloConfigPath() : qwenConfigPath()))
       )));
-    if (targets.length === 0) {
+    if (targets.length === 0 && !antigravityInstalled) {
       console.error(`no agents have the ${serverName} MCP tool installed`);
       return;
     }
@@ -14781,6 +15444,9 @@ function mcpUninstall(target?: string, serverName = "caveman") {
     if (removed) {
       process.stderr.write(`${mark("ok")} ${a.display_name}: ${serverName} MCP tool removed\n`);
     }
+  }
+  if (antigravityInstalled && uninstallMcpAntigravity(serverName)) {
+    process.stderr.write(`${mark("ok")} Antigravity: ${serverName} MCP tool removed\n`);
   }
 }
 
@@ -14847,14 +15513,14 @@ function removeMcpCodexToml(serverName = "caveman"): boolean {
 
 // removeMcpJson deletes a nested key from an agent's JSON config, leaving the
 // rest byte-identical in structure. Missing file/key counts as removed.
-function removeMcpJson(path: string, keyPath: string[]): boolean {
+function removeMcpJson(path: string, keyPath: string[], preserveBom = true): boolean {
   let root: Record<string, unknown>;
   let bom = "";
   let text = "";
   try {
     text = readFileSync(path, "utf8");
-    // A UTF-8 BOM (Windows PowerShell 5.1) is kept.
-    if (text.startsWith("\uFEFF")) bom = "\uFEFF";
+    // A UTF-8 BOM (Windows PowerShell 5.1) is kept unless caller strips it.
+    if (preserveBom && text.startsWith("\uFEFF")) bom = "\uFEFF";
     const parsed = parseJsonc(text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
     root = parsed as Record<string, unknown>;
@@ -16800,6 +17466,27 @@ function mcpInstall(target?: string, serverName = "caveman"): number {
   } else {
     mcp = resolveCloudMcpCommand();
   }
+  if (target && isAntigravityTarget(target)) {
+    const dest = installMcpAntigravity(serverName, mcp);
+    if (!dest) {
+      process.exitCode = 1;
+      return 0;
+    }
+    const tool = serverName === "caveman"
+      ? "caveman_retrieve"
+      : serverName === "caveman-browse"
+        ? "caveman_browse"
+        : serverName === "caveman-delegate"
+          ? "caveman_delegate"
+          : "caveman cloud tools";
+    process.stderr.write(`${mark("ok")} Antigravity: ${tool} installed → ${dest}\n`);
+    if (serverName === "caveman") {
+      process.stderr.write(dim("→ `caveman_retrieve` is ready in Antigravity MCP sessions\n"));
+    } else if (serverName === "caveman-cloud") {
+      process.stderr.write(dim("→ credentials stay in Caveman CLI store; run `caveman login` if disconnected\n"));
+    }
+    return 1;
+  }
   let targets: AgentProfile[];
   if (target) {
     const a = findAgent(target);
@@ -17035,14 +17722,14 @@ function codexMcpRegistrationMatches(serverName: string, mcp: { command: string;
 // installMcpJson merges a value at a nested key into an agent's JSON config without
 // disturbing the rest of it. It refuses to touch a file that is not a JSON object
 // (rather than corrupt it), and is idempotent.
-function installMcpJson(path: string, keyPath: string[], value: unknown): boolean {
+function installMcpJson(path: string, keyPath: string[], value: unknown, preserveBom = true): boolean {
   let root: Record<string, unknown> = {};
   let bom = "";
   let text = "";
   try {
     text = readFileSync(path, "utf8");
-    // A UTF-8 BOM (Windows PowerShell 5.1) is kept.
-    if (text.startsWith("\uFEFF")) bom = "\uFEFF";
+    // A UTF-8 BOM (Windows PowerShell 5.1) is kept unless caller strips it.
+    if (preserveBom && text.startsWith("\uFEFF")) bom = "\uFEFF";
     const raw = text.trim();
     if (raw) {
       const parsed = parseJsonc(raw);
@@ -17419,15 +18106,20 @@ async function shrinkHook() {
   if (nativePolicyMode() === "record" || !new Set(["full-safe", "full-max"]).has(nativeProfile())) process.exit(0);
   let raw: Buffer;
   try { raw = await readHookStdin(); } catch { process.exit(0); }
-  let evt: { tool_name?: string; tool_input?: Record<string, unknown> };
+  let evt: {
+    tool_name?: string;
+    tool_input?: Record<string, unknown>;
+    toolCall?: { name?: string; args?: Record<string, unknown> };
+  };
   try { evt = JSON.parse(raw.toString("utf8") || "{}"); } catch { process.exit(0); }
   const tool = evt?.tool_name;
   const isGemini = tool === "run_shell_command"; // Gemini CLI's shell tool
   const isBash = tool === "Bash";                // Claude Code + the opencode plugin
+  const isAntigravity = evt?.toolCall?.name === "run_command"; // Antigravity PreToolUse
   // Every other tool name — Codex's shell/shell_command/exec_command included — runs
   // as the host received it. See the #1037 note above before widening this.
-  if (!isGemini && !isBash) process.exit(0);
-  const command = evt.tool_input?.command;
+  if (!isGemini && !isBash && !isAntigravity) process.exit(0);
+  const command = isAntigravity ? evt.toolCall?.args?.CommandLine : evt.tool_input?.command;
   if (typeof command !== "string" || !shouldShrink(command)) process.exit(0);
   // updatedInput.command executes in the host's own shell — Git Bash under Claude
   // Code on Windows, PowerShell under the opencode plugin, cmd.exe under Gemini —
@@ -17438,22 +18130,14 @@ async function shrinkHook() {
   const prefix = cavemanBinForHostShell();
   if (!prefix) process.exit(0);
   const rewritten = `${prefix} shrink -- ${command.trim()}`;
-  // Gemini merges hookSpecificOutput.tool_input (snake_case, no event discriminator);
-  // Claude REPLACES via hookSpecificOutput.updatedInput (camelCase + hookEventName).
-  // Because Claude replaces, updatedInput must carry every field the host sent —
-  // rebuilding it from `command` alone dropped timeout, run_in_background and
-  // description, changing how the command ran (#1133). Gemini's merge already
-  // preserves the rest, so sending only `command` there is correct as written.
-  //
-  // No permissionDecision either. It is the same objection #1037 raised for Codex,
-  // and Claude Code — unlike Codex — provably honors it: answering "allow" turned a
-  // compression decision into a permission grant covering every state-changing
-  // command the allowlist accepts (`git push --force`, `kubectl delete`, `aws s3 rm`).
-  // Whether the host applies updatedInput without a decision is its call; if it does
-  // not, the command runs unwrapped and uncompressed, which is the safe direction.
-  const out = isGemini
-    ? { hookSpecificOutput: { tool_input: { command: rewritten } } }
-    : { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...evt.tool_input, command: rewritten } } };
+  // Antigravity merges `overwrite` shallowly into toolCall.args without a "decision"
+  // vote so host command-approval policies stay authoritative; Gemini merges
+  // hookSpecificOutput.tool_input; Claude REPLACES via updatedInput.
+  const out = isAntigravity
+    ? { overwrite: { CommandLine: rewritten } }
+    : isGemini
+      ? { hookSpecificOutput: { tool_input: { command: rewritten } } }
+      : { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...evt.tool_input, command: rewritten } } };
   process.stdout.write(JSON.stringify(out));
 }
 
@@ -18480,10 +19164,43 @@ async function memRecallHook() {
   telemetryCommandSent = true;
   let raw: Buffer;
   try { raw = await readHookStdin(); } catch { process.exit(0); }
-  let evt: { prompt?: string } | null; // `null` is valid JSON too
+  let evt: {
+    prompt?: unknown;
+    lastUserInput?: unknown;
+    invocationNum?: unknown;
+    initialNumSteps?: unknown;
+    conversationId?: unknown;
+  } | null; // `null` is valid JSON too
   try { evt = JSON.parse(raw.toString("utf8") || "{}"); } catch { process.exit(0); }
-  const prompt = typeof evt?.prompt === "string" ? evt.prompt.trim() : "";
+  const isAntigravity = typeof evt?.prompt !== "string" && typeof evt?.lastUserInput === "string";
+  if (isAntigravity) {
+    if (typeof evt?.invocationNum === "number" && evt.invocationNum > 0) process.exit(0);
+    if (/^\s*\[plan review(?:\s+due)?\]/i.test(evt!.lastUserInput as string)) process.exit(0);
+  }
+  const prompt = isAntigravity
+    ? (evt!.lastUserInput as string).trim()
+    : (typeof evt?.prompt === "string" ? evt.prompt.trim() : "");
   if (!prompt) process.exit(0);
+  if (isAntigravity) {
+    const convId = typeof evt?.conversationId === "string" && evt.conversationId ? evt.conversationId : "default";
+    const initialNumSteps = typeof evt?.initialNumSteps === "number" ? evt.initialNumSteps : -1;
+    const inputHash = createHash("sha256").update(evt!.lastUserInput as string).digest("hex").slice(0, 16);
+    const turnKey = `${initialNumSteps}:${inputHash}`;
+    const stateFile = join(
+      cavemanHome(),
+      "runtime",
+      "antigravity-recall",
+      `${convId.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`,
+    );
+    try {
+      if (existsSync(stateFile)) {
+        const prev = JSON.parse(readFileSync(stateFile, "utf8")) as { key?: string };
+        if (prev?.key === turnKey) process.exit(0);
+      }
+      mkdirSync(dirname(stateFile), { recursive: true });
+      writeFileSync(stateFile, JSON.stringify({ key: turnKey }) + "\n");
+    } catch { /* best-effort per-turn dedup */ }
+  }
   const out = cavememRun(["recall", prompt, "3"], { soft: true });
   if (!out) process.exit(0);
   let parsed: { hits?: Array<{ text?: string; tokens_added?: number; recovery_handle?: string }> } | null;
@@ -18496,6 +19213,12 @@ async function memRecallHook() {
     return `[cavemem recall · +${tokens} tokens · basis inferred${recover}]\n${h.text ?? ""}`;
   });
   const additionalContext = "Relevant memories recalled by cavemem (compressed; cost disclosed):\n\n" + blocks.join("\n\n");
+  if (isAntigravity) {
+    process.stdout.write(JSON.stringify({
+      injectSteps: [{ systemMessage: { systemMessage: additionalContext } }],
+    }));
+    return;
+  }
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext } }));
 }
 
@@ -18509,14 +19232,30 @@ function memHook(rest: string[]) {
     process.exit(2);
   }
   const target = rest[1];
+  if (target && isAntigravityTarget(target)) {
+    if (sub === "install") {
+      const dest = installRecallHookAntigravity();
+      if (!dest) {
+        process.exitCode = 1;
+        return;
+      }
+      process.stderr.write(`${mark("ok")} Antigravity: auto-recall hook installed → ${dest}\n`);
+      process.stderr.write(dim("→ opt-in auto-recall is on; every injection discloses its token cost. Remove with `caveman mem hook uninstall antigravity`.\n"));
+      return;
+    }
+    const removed = removeRecallHookAntigravity();
+    process.stderr.write(`${mark(removed ? "ok" : "warn")} Antigravity: ${removed ? "auto-recall hook removed" : "no caveman recall hook found"}\n`);
+    return;
+  }
   let targets: AgentProfile[];
+  const antigravityRecallInstalled = !target && sub === "uninstall" && recallHookInstalled("antigravity");
   if (target) {
     const a = findAgent(target);
     if (!a) { console.error(`unknown agent '${target}'. known: ${AGENTS.map((x) => x.id).join(", ")}`); process.exit(2); }
     targets = [a];
   } else {
     targets = AGENTS.filter((a) => memoryHookKind(a) !== "none" && which(binOf(a)));
-    if (targets.length === 0) {
+    if (targets.length === 0 && !antigravityRecallInstalled) {
       console.error("no agent with an auto-recall surface detected on PATH; pass an agent id, e.g. `caveman mem hook install claude`");
       process.exit(1);
     }
@@ -18539,6 +19278,10 @@ function memHook(rest: string[]) {
     const removed = removeRecallHookForAgent(a);
     try { unlinkSync(recallHookMarkerPath(a.id)); } catch { /* no marker — fine */ }
     process.stderr.write(`${mark(removed ? "ok" : "warn")} ${a.display_name}: ${removed ? "auto-recall hook removed" : "no caveman recall hook found"}\n`);
+  }
+  if (antigravityRecallInstalled) {
+    const removed = removeRecallHookAntigravity();
+    process.stderr.write(`${mark(removed ? "ok" : "warn")} Antigravity: ${removed ? "auto-recall hook removed" : "no caveman recall hook found"}\n`);
   }
 }
 
@@ -19424,6 +20167,10 @@ function hooksDirectiveCmd(sub: "install" | "uninstall", directiveId: string, ta
   // never written to a guessed path.
   let targets: AgentProfile[];
   if (target) {
+    if (isAntigravityTarget(target)) {
+      console.error("caveman: antigravity uses .agents/rules/caveman.md or the caveman plugin instead of hooks --directive (run: caveman-init --agent antigravity)");
+      process.exit(2);
+    }
     const a = findAgent(target);
     if (!a) { console.error(`unknown agent '${target}'. known: ${AGENTS.map((x) => x.id).join(", ")}`); process.exit(2); }
     if (!instructionFileForAgent(a)) {
@@ -19493,7 +20240,23 @@ function hooksCmd(rest: string[]) {
   if (sub !== "install" && sub !== "uninstall") hooksUsage();
   if (directiveId) return hooksDirectiveCmd(sub, directiveId, rest[1]);
   const target = rest[1];
+  if (target && isAntigravityTarget(target)) {
+    if (sub === "install") {
+      const dest = installShrinkHookAntigravity();
+      if (!dest) {
+        process.exitCode = 1;
+        return;
+      }
+      process.stderr.write(`${mark("ok")} Antigravity: command-output rewrite hook installed → ${dest}\n`);
+      process.stderr.write(dim("→ noisy command output is now auto-shrunk; remove with `caveman hooks uninstall antigravity`\n"));
+      return;
+    }
+    const removed = removeShrinkHookAntigravity();
+    process.stderr.write(`${mark(removed ? "ok" : "warn")} Antigravity: ${removed ? "command-output hook removed" : "no caveman hook found"}\n`);
+    return;
+  }
   let targets: AgentProfile[];
+  const antigravityShrinkInstalled = !target && sub === "uninstall" && shrinkHookInstalled("antigravity");
   if (target) {
     const a = findAgent(target);
     if (!a) { console.error(`unknown agent '${target}'. known: ${AGENTS.map((x) => x.id).join(", ")}`); process.exit(2); }
@@ -19503,7 +20266,7 @@ function hooksCmd(rest: string[]) {
     // that is actually present on PATH (mirrors `mcp install`'s detect-all path).
     // "native" surfaces install through `caveman enable <agent>`, not here.
     targets = AGENTS.filter((a) => commandHookKind(a) !== "none" && commandHookKind(a) !== "native" && which(binOf(a)));
-    if (targets.length === 0) {
+    if (targets.length === 0 && !antigravityShrinkInstalled) {
       console.error("no hookable agents detected on PATH; pass an agent id, e.g. `caveman hooks install claude`");
       process.exit(1);
     }
@@ -19548,6 +20311,10 @@ function hooksCmd(rest: string[]) {
     const removed = removeShrinkHookForAgent(a);
     try { unlinkSync(shrinkHookMarkerPath(a.id)); } catch { /* no marker — fine */ }
     process.stderr.write(`${mark(removed ? "ok" : "warn")} ${a.display_name}: ${removed ? "command-output hook removed" : "no caveman hook found"}\n`);
+  }
+  if (antigravityShrinkInstalled) {
+    const removed = removeShrinkHookAntigravity();
+    process.stderr.write(`${mark(removed ? "ok" : "warn")} Antigravity: ${removed ? "command-output hook removed" : "no caveman hook found"}\n`);
   }
 }
 
@@ -21014,7 +21781,12 @@ async function learn(rest: string[]) {
 // explicit env, then PATH, then ~/.caveman/bin. The CLI only ever shells out to it (no
 // runtime deps), so recall/scoring logic stays in the gated Go core.
 function resolveCavememCommand(): { command: string; args: string[] } {
-  return { command: cavemanBin("cavemem", "CAVEMEM_BIN"), args: [] };
+  const bin = cavemanBin("cavemem", "CAVEMEM_BIN");
+  try {
+    return portableInvocation(bin, []);
+  } catch {
+    return { command: bin, args: [] };
+  }
 }
 
 // cavememRun shells to cavemem and returns its stdout. On failure it surfaces the

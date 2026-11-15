@@ -47,6 +47,7 @@ const HOST_MANIFESTS = [
   '.cursor-plugin/plugin.json',
   'gemini-extension.json',
   'plugins/caveman/.codex-plugin/plugin.json',
+  'plugins/antigravity/plugin.json',
 ];
 
 for (const rel of HOST_MANIFESTS) {

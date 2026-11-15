@@ -1,9 +1,29 @@
+﻿param([string]$HostName = "")
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME ".claude" }
+$ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) {
+    $env:CLAUDE_CONFIG_DIR
+} elseif ($env:PLUGIN_DATA) {
+    $env:PLUGIN_DATA
+} elseif ($HostName -eq "antigravity") {
+    $AgentsState = Join-Path (Join-Path (Get-Location).Path ".agents") ".caveman-state"
+    $AgyCliData = Join-Path (Join-Path (Join-Path (Join-Path $HOME ".gemini") "antigravity-cli") "plugin_data") "caveman"
+    $AgyIdeData = Join-Path (Join-Path (Join-Path (Join-Path $HOME ".gemini") "antigravity") "plugin_data") "caveman"
+    if (Test-Path -LiteralPath (Join-Path (Get-Location).Path ".agents")) {
+        $AgentsState
+    } elseif (Test-Path -LiteralPath $AgyCliData) {
+        $AgyCliData
+    } elseif (Test-Path -LiteralPath $AgyIdeData) {
+        $AgyIdeData
+    } else {
+        Join-Path (Join-Path (Join-Path $HOME ".gemini") "config") ".caveman-state"
+    }
+} else {
+    Join-Path $HOME ".claude"
+}
 
-# Claude Code sends session JSON on stdin, including session_id. We use it to
-# read THIS window's mode instead of a machine-wide flag — otherwise every
-# window renders whichever mode was set last.
+# Claude Code / Antigravity send session JSON on stdin (session_id or conversationId).
+# We use it to read THIS window's mode instead of a machine-wide flag — otherwise
+# every window renders whichever mode was set last.
 #
 # Two guards keep this from wedging the status bar, mirroring the bash port:
 #   1. IsInputRedirected — an interactive console is never read from.
@@ -16,7 +36,11 @@ if ([Console]::IsInputRedirected) {
         if ($task.Wait(1000)) {
             $payload = $task.Result
             if ($payload) {
-                $SessionId = [string](ConvertFrom-Json $payload).session_id
+                $parsed = ConvertFrom-Json $payload
+                $SessionId = [string]$parsed.session_id
+                if (-not $SessionId) {
+                    $SessionId = [string]$parsed.conversationId
+                }
             }
         }
     } catch {

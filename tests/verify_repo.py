@@ -290,6 +290,69 @@ def verify_synced_files() -> None:
     # marketplaces reject the plugin outright (#1035). Tracked files only —
     # gitignored files never reach a marketplace clone, and
     # scripts/install-local-cli.sh writes its shim to .local-bin/ instead.
+    agy_root = ROOT / "plugins/antigravity"
+    ensure(not (agy_root / "rules").exists(), "plugins/antigravity/rules must not exist")
+
+    agy_hooks = (
+        "package.json",
+        "caveman-antigravity.js",
+        "caveman-config.js",
+        "caveman-parse.js",
+        "caveman-stats.js",
+    )
+    for filename in agy_hooks:
+        copy = agy_root / "hooks" / filename
+        source = ROOT / "src/hooks" / filename
+        ensure(copy.exists(), f"Missing Antigravity hook mirror: {copy}")
+        ensure(copy.read_bytes() == source.read_bytes(), f"Antigravity hook mirror mismatch: {copy}")
+
+    agy_logo = agy_root / "assets/caveman.svg"
+    source_logo = ROOT / "plugins/caveman/assets/caveman.svg"
+    ensure(agy_logo.exists(), f"Missing Antigravity logo mirror: {agy_logo}")
+    ensure(agy_logo.read_bytes() == source_logo.read_bytes(), f"Antigravity logo mirror mismatch: {agy_logo}")
+
+    agy_skills = (
+        "caveman",
+        "ultracave",
+        "megacave",
+        "caveman-commit",
+        "caveman-review",
+        "caveman-help",
+        "caveman-stats",
+        "cavecrew",
+        "caveman-compress",
+    )
+    for skill in agy_skills:
+        copy = agy_root / "skills" / skill / "SKILL.md"
+        source = ROOT / "skills" / skill / "SKILL.md"
+        ensure(copy.exists(), f"Missing Antigravity skill mirror: {copy}")
+        ensure(
+            copy.read_text(encoding="utf-8") == source.read_text(encoding="utf-8"),
+            f"Antigravity skill mirror mismatch: {copy}",
+        )
+
+    agy_scripts_dir = agy_root / "skills/caveman-compress/scripts"
+    src_scripts_dir = ROOT / "skills/caveman-compress/scripts"
+    ensure(agy_scripts_dir.is_dir(), f"Missing Antigravity scripts dir: {agy_scripts_dir}")
+    ensure(not (agy_scripts_dir / "__pycache__").exists(), f"Unexpected __pycache__ in {agy_scripts_dir}")
+    src_scripts = {p.name: p for p in src_scripts_dir.glob("*.py")}
+    agy_scripts = {p.name: p for p in agy_scripts_dir.iterdir()}
+    ensure(
+        set(agy_scripts) == set(src_scripts),
+        f"Antigravity compress scripts mismatch: {sorted(agy_scripts)} vs {sorted(src_scripts)}",
+    )
+    for name, src_path in src_scripts.items():
+        ensure(
+            agy_scripts[name].read_text(encoding="utf-8") == src_path.read_text(encoding="utf-8"),
+            f"Antigravity compress script content mismatch: {name}",
+        )
+
+    for agent_name in ("cavecrew-investigator.md", "cavecrew-builder.md", "cavecrew-reviewer.md"):
+        ensure(
+            (agy_root / "agents" / agent_name).is_file(),
+            f"Missing Antigravity agent: {agy_root / 'agents' / agent_name}",
+        )
+
     ensure(
         not run(["git", "ls-files", "--", "bin"]).stdout.strip(),
         "top-level bin/ ships inside the Claude plugin (plugin root = repo root) "
@@ -311,6 +374,8 @@ def verify_manifests_and_syntax() -> None:
         ROOT / ".codex/hooks.json",
         ROOT / "gemini-extension.json",
         ROOT / "plugins/caveman/.codex-plugin/plugin.json",
+        ROOT / "plugins/antigravity/plugin.json",
+        ROOT / "plugins/antigravity/hooks.json",
     ]
     for path in manifest_paths:
         read_json(path)
@@ -382,6 +447,7 @@ def verify_manifests_and_syntax() -> None:
         "caveman-statusline.ps1",
         "cavecrew-model-overrides.js",
         "caveman-host-session-start.js",
+        "caveman-antigravity.js",
     }
     manifest: dict[str, str] = {}
     for line in (hook_dir / "checksums.sha256").read_text(encoding="utf-8").splitlines():
@@ -398,6 +464,9 @@ def verify_manifests_and_syntax() -> None:
     run(["node", "--check", "src/hooks/caveman-mode-tracker.js"])
     run(["node", "--check", "src/hooks/cavecrew-model-overrides.js"])
     run(["node", "--check", "src/hooks/caveman-host-session-start.js"])
+    run(["node", "--check", "src/hooks/caveman-antigravity.js"])
+    run(["node", "--check", "src/hooks/caveman-stats.js"])
+    run(["node", "--check", "installer/lib/antigravity-native.js"])
     run(["node", "--check", "installer/install.js"])
     run(["node", "--check", "installer/lib/settings.js"])
     bash = shutil.which("bash")
@@ -1198,6 +1267,7 @@ def verify_hidden_child_windows() -> None:
     call_re = re.compile(r"\b(?:execFileSync|execSync|spawnSync|execFile|spawn)\s*\(")
     targets = [
         ROOT / "src/hooks/caveman-mode-tracker.js",
+        ROOT / "src/hooks/caveman-antigravity.js",
         ROOT / "src/mcp-servers/caveman-shrink/index.js",
         ROOT / "packages/pi-extension/src/recovery.ts",
         ROOT / "packages/pi-extension/src/lifecycle.ts",

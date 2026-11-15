@@ -107,8 +107,8 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **Replit Agent** | From the project Shell: `npx skills add JuliusBrussee/caveman -a replit` | No |
 | **JetBrains Junie** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a junie -g` | No |
 | **Qoder** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a qoder -g` | No |
-| **Antigravity IDE** *(soft probe)* | `npx -y github:JuliusBrussee/caveman -- --only antigravity` | No |
-| **Antigravity 2.0** *(explicit selection)* | `npx -y github:JuliusBrussee/caveman -- --only antigravity-2` | No |
+| **Antigravity IDE** *(soft probe)* | `npx -y github:JuliusBrussee/caveman -- --only antigravity` | Skills only globally; yes per-workspace via `node src/tools/caveman-init.js --only antigravity [--with-hooks]` |
+| **Antigravity 2.0** *(explicit selection)* | `npx -y github:JuliusBrussee/caveman -- --only antigravity-2` | Covered automatically when **Antigravity CLI** unified plugin is installed; skills only otherwise |
 
 Not in the table, with their own steps below: [Claude apps (claude.ai, desktop, mobile, Cowork)](#claude-apps-claudeai-desktop-mobile-cowork), [GitHub Copilot in VS Code](#github-copilot-in-vs-code-agent-plugin), [nanocoder](#nanocoder), and [dev containers](#dev-containers-codespaces-remote-machines).
 
@@ -237,16 +237,11 @@ there: for VS Code Copilot Chat, use `--with-init` for always-on.
 
 ### Antigravity CLI
 
-With `agy` on your PATH, `--only antigravity-cli` builds a small `caveman`
-plugin (the skills plus one always-on rule) and installs it with
-`agy plugin install`. Every new `agy` session then talks caveman. Checked with
-agy 1.2.17.
+With `agy` on your PATH (or at `~/.gemini/bin/agy`), `--only antigravity-cli` stages a full `caveman` plugin (the 9 skills, 3 Cavecrew agents, and `SessionStart` + `PreInvocation` hooks powered by `caveman-antigravity.js` and `caveman-stats.js`) and installs it via `agy plugin install` (checked with `agy` 1.5.9).
 
-The rule is fixed text, so `defaultMode` settings do not reach it. To go back
-to normal prose, say `stop caveman` in a session, or switch the plugin off for
-good with `agy plugin disable caveman` (`enable` turns it back on).
-`--uninstall` runs `agy plugin uninstall caveman`. This is separate from the
-**Antigravity IDE** and **Antigravity 2.0** rows, which copy skills only.
+The hooked plugin honors `defaultMode` (`~/.config/caveman/config.json`, repo `.caveman.json`, or `CAVEMAN_DEFAULT_MODE`), `reinforce`, mid-session `/caveman`, `/ultracave`, `/megacave`, `/caveman-stats`, `/caveman status`, and `stop caveman`. Pass `--no-hooks` or `--minimal` to install static `rules/AGENTS.md` without Node hooks. Switch the plugin off globally with `agy plugin disable caveman` (`enable` restores it); `--uninstall` runs `agy plugin uninstall caveman`. When the unified plugin is installed, redundant `~/.gemini/config/skills` (`antigravity-2`) copies and migrated `~/.gemini/antigravity/skills` (`antigravity`) copies are skipped automatically.
+
+To wire Antigravity CLI's native hooks/MCP integration via `@caveman-ai/cli`, use `caveman enable antigravity` / `caveman disable antigravity` / `caveman doctor antigravity`. For a CLI statusline badge alongside your prompt, add a `statusLine` entry in `~/.gemini/antigravity-cli/settings.json` with `"stack_with_default": true` running `caveman-statusline.sh --host antigravity` (or `caveman-statusline.ps1 -HostName antigravity` on Windows). For per-workspace `.agents/` rules or hooks in Antigravity IDE / Desktop without the `agy` plugin, run `node src/tools/caveman-init.js --only antigravity [--with-hooks]`.
 
 ### Claude apps: claude.ai, desktop, mobile, Cowork
 

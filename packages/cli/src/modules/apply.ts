@@ -110,6 +110,8 @@ export type ModuleHost = {
   signIn(): Promise<void>;
   // The CLI telemetry opt-out (config, DO_NOT_TRACK, CAVEMAN_TELEMETRY=0).
   telemetryOff(): boolean;
+  // Native Antigravity health check (never reads ~/.gemini/config/config.json).
+  antigravityDoctor?: () => { configured: boolean; failures: string[]; notes: string[] };
 };
 
 let host: ModuleHost | undefined;

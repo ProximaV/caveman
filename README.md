@@ -95,7 +95,7 @@ npx @caveman-ai/cli@latest
 
 One command. Mac, Linux, Windows. Caveman find your agents and your logins, show what it change. Press Enter. Done. Needs Node.js 22.13+.
 
-After that, plain `claude` stays caveman'd. So do Codex, Gemini CLI, OpenCode, and [30+ more](./INSTALL.md). It runs on your machine, with your keys and your Claude Pro/Max login. One rock. That it.
+After that, plain `claude` stays caveman'd. So do Codex, Gemini CLI, Antigravity, OpenCode, and [30+ more](./INSTALL.md). It runs on your machine, with your keys and your Claude Pro/Max login. One rock. That it.
 
 <sub>Had caveman before 4.0? Say <code>@latest</code>, or the old copy on your machine wins. Already set up? <code>caveman setup</code> opens the screen again. Only want shorter answers? <a href="#say-less-the-caveman-voice">Get just the skill</a>.</sub>
 
@@ -165,7 +165,7 @@ npx skills add JuliusBrussee/caveman -g
 Type `/caveman` (`$caveman` in Codex) if it doesn't start on its own. Say `stop caveman` to go back.
 
 <details>
-<summary><strong>Other ways in</strong>: Claude app and phone, Claude Code plugin, Gemini, every agent at once, Windows, uninstall</summary>
+<summary><strong>Other ways in</strong>: Claude app and phone, Claude Code plugin, Gemini, Antigravity, every agent at once, Windows, uninstall</summary>
 
 <br>
 
@@ -177,6 +177,9 @@ claude plugin marketplace add JuliusBrussee/caveman && claude plugin install cav
 
 # Gemini CLI
 gemini extensions install https://github.com/JuliusBrussee/caveman
+
+# Antigravity (CLI, Desktop, IDE)
+npx -y github:JuliusBrussee/caveman -- --only antigravity-cli
 
 # Every agent on your machine at once, plus the Claude Code statusline badge (Node.js 22.13+)
 curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.1.0/install.sh | bash
@@ -303,7 +306,7 @@ In your agent:
 | `/caveman-commit` | One-line Conventional Commit |
 | `/caveman-review` | One finding per line: `L42: 🔴 null deref. Guard it.` |
 | `/caveman-compress <file>` | Shrinks memory files and backs up the original |
-| `/caveman-stats` | Real token usage for this Claude Code session |
+| `/caveman-stats` | Real token usage for this Claude Code or Antigravity session |
 | `/caveman-help` | Every mode and command on one screen |
 | `cavecrew` | Subagents that find, edit, and review code, then report back in caveman |
 | `investigate-first` · `lean-build` · `surgical-patch` · `safe-refactor` · `migration` · `verify-and-stop` | Work patterns that write less code. Your agent picks them up when a task fits |

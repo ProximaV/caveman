@@ -1267,5 +1267,81 @@ test('stats fallback message names the script path that actually exists', (tmp) 
     `fallback suggests a path that does not exist: ${suggested[1].trim()}`);
 });
 
+test('--host antigravity parses PLANNER_RESPONSE transcripts, attributes mode log, and isolates Claude history', (tmp) => {
+  const claudeDir = path.join(tmp, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const claudeHistory = path.join(claudeDir, '.caveman-history.jsonl');
+  const claudeSuffix = path.join(claudeDir, '.caveman-statusline-suffix');
+  fs.writeFileSync(claudeHistory, 'existing Claude history\n');
+  fs.writeFileSync(claudeSuffix, 'existing Claude suffix');
+
+  const convId = '11111111-2222-3333-4444-555555555555';
+  const logsDir = path.join(tmp, 'agy', 'brain', convId, '.system_generated', 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+  const transcript = path.join(logsDir, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', created_at: '2026-11-14T10:00:00.000Z' },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', output_tokens: 150, cache_read_tokens: 900, model: 'gemini-2.5-pro', created_at: '2026-11-14T10:00:05.000Z' },
+    // Duplicate step_index must only be counted once.
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', output_tokens: 150, cache_read_tokens: 900, created_at: '2026-11-14T10:00:05.000Z' },
+    { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', output_tokens: 250, cache_read_tokens: 1100, created_at: '2026-11-14T10:02:00.000Z' },
+  ].map(o => JSON.stringify(o)).join('\n') + '\n');
+
+  const stateDir = path.join(tmp, 'plugin-data');
+  fs.mkdirSync(path.join(stateDir, '.caveman-sessions'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, '.caveman-sessions', `${convId}.mode`), 'ultracave');
+  const modeLog = [
+    { ts: Date.parse('2026-11-14T09:59:59.000Z'), mode: 'caveman', prev: null, session_id: convId },
+    { ts: Date.parse('2026-11-14T10:01:00.000Z'), mode: 'ultracave', prev: 'caveman', session_id: convId },
+  ];
+  fs.writeFileSync(path.join(stateDir, '.caveman-mode-log.jsonl'), modeLog.map(o => JSON.stringify(o)).join('\n') + '\n');
+
+  const out = execFileSync(process.execPath, [STATS, '--host', 'antigravity', '--session-file', transcript], {
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, PLUGIN_DATA: stateDir },
+  });
+  assert.match(out, /Turns:\s+2/);
+  assert.match(out, /Output tokens:\s+400/);
+  assert.match(out, /Cache-read tokens:\s+2,000/);
+  assert.match(out, /caveman:\s+150 tokens/);
+  assert.match(out, /ultracave:\s+250 tokens/);
+  assertSavingsUnknown(out);
+
+  // Antigravity history must key on conversationId (not 'transcript') and never touch Claude history.
+  const agyHistoryRows = fs.readFileSync(path.join(stateDir, '.caveman-history.jsonl'), 'utf8')
+    .trim().split('\n').map(l => JSON.parse(l));
+  assert.strictEqual(agyHistoryRows.length, 1);
+  assert.strictEqual(agyHistoryRows[0].session_id, convId);
+  assert.strictEqual(agyHistoryRows[0].model, 'gemini-2.5-pro');
+  assert.strictEqual(agyHistoryRows[0].output_tokens, 400);
+  assert.strictEqual(fs.readFileSync(claudeHistory, 'utf8'), 'existing Claude history\n');
+  assert.strictEqual(fs.readFileSync(claudeSuffix, 'utf8'), 'existing Claude suffix');
+});
+
+test('--host antigravity discovers newest transcript via AGY_DATA_DIR', (tmp) => {
+  const agyData = path.join(tmp, 'agy-data');
+  const olderDir = path.join(agyData, 'brain', 'conv-old', '.system_generated', 'logs');
+  const newerDir = path.join(agyData, 'brain', 'conv-new', '.system_generated', 'logs');
+  fs.mkdirSync(olderDir, { recursive: true });
+  fs.mkdirSync(newerDir, { recursive: true });
+  const older = path.join(olderDir, 'transcript.jsonl');
+  const newer = path.join(newerDir, 'transcript.jsonl');
+  fs.writeFileSync(older, JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', output_tokens: 111 }) + '\n');
+  fs.writeFileSync(newer, JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', output_tokens: 333 }) + '\n');
+  const now = Math.floor(Date.now() / 1000);
+  fs.utimesSync(older, now - 120, now - 120);
+  fs.utimesSync(newer, now, now);
+
+  const stateDir = path.join(tmp, 'agy-state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const out = execFileSync(process.execPath, [STATS, '--host', 'antigravity'], {
+    encoding: 'utf8',
+    env: { ...process.env, AGY_DATA_DIR: agyData, PLUGIN_DATA: stateDir },
+  });
+  assert.match(out, /Output tokens:\s+333/);
+  const historyRow = JSON.parse(fs.readFileSync(path.join(stateDir, '.caveman-history.jsonl'), 'utf8').trim());
+  assert.strictEqual(historyRow.session_id, 'conv-new');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

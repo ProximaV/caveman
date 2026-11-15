@@ -55,13 +55,16 @@ test('greenfield: creates all rule files with proper frontmatter', (tmp) => {
   assert.match(agents, /Respond terse/);
   const opencode = fs.readFileSync(path.join(tmp, '.opencode/AGENTS.md'), 'utf8');
   assert.match(opencode, /Respond terse/);
+  const antigravity = fs.readFileSync(path.join(tmp, '.agents/rules/caveman.md'), 'utf8');
+  assert.match(antigravity, /trigger: always_on/);
+  assert.match(antigravity, /Respond terse/);
 });
 
 test('idempotent: re-running on a clean install skips all', (tmp) => {
   runInit(tmp);
   const out = runInit(tmp);
-  // 6 repo rule files skipped-already-installed + openclaw skipped (no workspace)
-  assert.match(out, /7 skipped/);
+  // 7 repo rule files skipped-already-installed + openclaw skipped (no workspace)
+  assert.match(out, /8 skipped/);
   assert.doesNotMatch(out, /[1-9]\d* added/);
 });
 
@@ -97,6 +100,7 @@ for (const [agent, file] of [
   ['cursor', '.cursor/rules/caveman.mdc'],
   ['windsurf', '.windsurf/rules/caveman.md'],
   ['cline', '.clinerules/caveman.md'],
+  ['antigravity', '.agents/rules/caveman.md'],
 ]) {
   test(`--force refreshes an installed ${agent} rule; default and dry-run preserve it`, (tmp) => {
     runInit(tmp, '--only', agent);
@@ -120,12 +124,13 @@ for (const [agent, file] of [
 test('--dry-run: announces but writes nothing', (tmp) => {
   const out = runInit(tmp, '--dry-run');
   assert.match(out, /\(dry run\)/);
-  assert.match(out, /6 added/);
+  assert.match(out, /7 added/);
   assert.ok(!fs.existsSync(path.join(tmp, '.cursor')));
   assert.ok(!fs.existsSync(path.join(tmp, '.windsurf')));
   assert.ok(!fs.existsSync(path.join(tmp, '.clinerules')));
   assert.ok(!fs.existsSync(path.join(tmp, '.github/copilot-instructions.md')));
   assert.ok(!fs.existsSync(path.join(tmp, '.opencode')));
+  assert.ok(!fs.existsSync(path.join(tmp, '.agents')));
   assert.ok(!fs.existsSync(path.join(tmp, 'AGENTS.md')));
 });
 
@@ -240,6 +245,35 @@ test('INSTALL.md repo-only commands write nothing outside the repo', (tmp) => {
   assert.deepStrictEqual(fs.readdirSync(ws), [], 'repo-only init wrote into the OpenClaw workspace');
   assert.deepStrictEqual(fs.readdirSync(home), ['.openclaw']);
   assert.ok(fs.readdirSync(repo).length > 0, 'nothing written into the repo');
+});
+
+test('--only antigravity --with-hooks scaffolds .agents/hooks.json and hook scripts without .agents/rules/caveman.md', (tmp) => {
+  // Prior static rule + user-defined hook entry in hooks.json
+  runInit(tmp, '--only', 'antigravity');
+  assert.ok(fs.existsSync(path.join(tmp, '.agents/rules/caveman.md')));
+  fs.writeFileSync(path.join(tmp, '.agents/hooks.json'), JSON.stringify({
+    'lint-checker': { PostToolUse: [{ matcher: 'run_command', hooks: [{ type: 'command', command: './lint.sh' }] }] },
+  }, null, 2));
+
+  const out = runInit(tmp, '--only', 'antigravity', '--with-hooks');
+  assert.match(out, /\.agents\/hooks\.json \(overwritten\)/);
+  assert.equal(fs.existsSync(path.join(tmp, '.agents/rules/caveman.md')), false);
+
+  const hooksJson = JSON.parse(fs.readFileSync(path.join(tmp, '.agents/hooks.json'), 'utf8'));
+  assert.ok(hooksJson['lint-checker'], 'must preserve unrelated user hook entries');
+  assert.equal(hooksJson.caveman.SessionStart[0].command, 'node ./hooks/caveman-antigravity.js session-start');
+  assert.equal(hooksJson.caveman.PreInvocation[0].command, 'node ./hooks/caveman-antigravity.js pre-invocation');
+
+  for (const f of ['package.json', 'caveman-antigravity.js', 'caveman-config.js', 'caveman-parse.js', 'caveman-stats.js']) {
+    assert.strictEqual(
+      fs.readFileSync(path.join(tmp, '.agents/hooks', f), 'utf8'),
+      fs.readFileSync(path.join(ROOT, 'src/hooks', f), 'utf8'),
+    );
+  }
+
+  // Re-running is idempotent
+  const second = runInit(tmp, '--only', 'antigravity', '--with-hooks');
+  assert.match(second, /skipped-already-installed/);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
